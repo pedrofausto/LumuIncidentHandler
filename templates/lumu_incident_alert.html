@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#0a0f1a;font-family:Arial,sans-serif;color:#fff">
+
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#0a0f1a">
+<tr><td align="center" style="padding:20px 10px">
+<table role="presentation" cellpadding="0" cellspacing="0" width="750" style="background-color:#0f1726;border:1px solid #1c2a44;border-radius:8px">
+
+  <!-- HEADER -->
+  <tr><td style="background-color:#0b1424;padding:15px 20px;border-bottom:1px solid #1c2a44">
+    <table role="presentation" width="100%">
+      <tr>
+        <td width="60%">
+          <div style="color:#8aa3c7;font-size:10px;font-family:'Courier New',monospace">
+            <div><strong>Data/Hora:</strong> {{ date_time }}</div>
+            <div><strong>Monitor ID:</strong> {{ monitor_id }}</div>
+            <div><strong>Tenant:</strong> {{ tenant_name }}</div>
+          </div>
+        </td>
+        <td width="40%" align="right">
+          <img src="https://i.imgur.com/TvG2211.png" style="width:120px;height:auto">
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+
+  <!-- SEVERITY STRIPE -->
+  <tr><td style="background-color:{{ stripe_color }};height:4px"></td></tr>
+
+  <!-- TITLE BAR -->
+  <tr><td style="background-color:#0b1424;padding:15px 20px;border-bottom:1px solid #1c2a44">
+    <div style="color:#b8d4ff;font-size:16px;font-weight:600">[Lumu Alert] Detecção de Incidentes de Segurança</div>
+    <div style="color:#7ea2d6;font-size:11px;margin-top:5px">Lumu Defender API · Threat Intelligence Correlation · Status: {{ incident_count }} Novo(s) Incidente(s)</div>
+  </td></tr>
+
+  <!-- BODY -->
+  <tr><td style="padding:20px">
+
+    <!-- SUMMARY -->
+    <table role="presentation" width="100%" style="margin-bottom:20px">
+      <tr>
+        <td style="vertical-align:top">
+          <div style="background-color:#0b1424;border:1px solid #1c2a44;border-left:3px solid {{ stripe_color }};border-radius:6px;padding:15px">
+            <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 10px">RESUMO DA AMEAÇA</div>
+            <div style="color:#c6dcff;font-size:12px;line-height:1.6">
+              {{ incident_summary }}
+            </div>
+          </div>
+        </td>
+      </tr>
+    </table>
+
+    <!-- INCIDENT LIST -->
+    <div style="background-color:#0b1424;border:1px solid #1c2a44;border-radius:6px;padding:15px;margin-bottom:20px">
+      <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 12px;letter-spacing:.5px">
+        <span style="color:#79c0ff">◢</span> INCIDENTES DETECTADOS
+      </div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
+        <tr style="border-bottom:1px solid #1c2a44">
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Severidade</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Título do Incidente</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Tipo / Adversário</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Endpoints</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Indicadores STIX</th>
+        </tr>
+        {{ incident_rows }}
+      </table>
+    </div>
+
+    <!-- ACTIONS -->
+    <div style="background-color:#0b1424;border:1px solid #1a2a44;border-radius:6px;padding:15px;margin-bottom:20px">
+      <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 15px;letter-spacing:.5px">
+        <span style="color:#79c0ff">◢</span> PRÓXIMOS PASSOS RECOMENDADOS
+      </div>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:12px">
+        <tr>
+          <td width="30" style="vertical-align:top;padding-right:12px">
+            <div style="width:24px;height:24px;background-color:#112644;border:1px solid #5fb8ff;border-radius:50%;text-align:center;line-height:22px">
+              <span style="font-size:11px;font-weight:700;color:#79c0ff">1</span>
+            </div>
+          </td>
+          <td>
+            <div style="color:#c6dcff;font-size:11px;line-height:1.6">
+              <strong>Isolar Endpoints:</strong> Revise os {{ total_endpoints }} endpoints afetados e considere o isolamento preventivo caso a severidade seja Crítica ou Alta.
+            </div>
+          </td>
+        </tr>
+      </table>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:12px">
+        <tr>
+          <td width="30" style="vertical-align:top;padding-right:12px">
+            <div style="width:24px;height:24px;background-color:#112644;border:1px solid #e67e22;border-radius:50%;text-align:center;line-height:22px">
+              <span style="font-size:11px;font-weight:700;color:#e67e22">2</span>
+            </div>
+          </td>
+          <td>
+            <div style="color:#c6dcff;font-size:11px;line-height:1.6">
+              <strong>Bloqueio de Indicadores:</strong> Aplique os indicadores STIX listados em seus firewalls, proxies ou EDRs para conter a propagação.
+            </div>
+          </td>
+        </tr>
+      </table>
+
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td width="30" style="vertical-align:top;padding-right:12px">
+            <div style="width:24px;height:24px;background-color:#112644;border:1px solid #c0392b;border-radius:50%;text-align:center;line-height:22px">
+              <span style="font-size:11px;font-weight:700;color:#c0392b">3</span>
+            </div>
+          </td>
+          <td>
+            <div style="color:#c6dcff;font-size:11px;line-height:1.6">
+              <strong>Investigação Lumu:</strong> Acesse o portal Lumu para visualizar a linha do tempo completa do incidente e as recomendações de mitigação específicas.
+            </div>
+          </td>
+        </tr>
+      </table>
+    </div>
+
+  </td></tr>
+
+  <!-- FOOTER -->
+  <tr><td style="background-color:#0b1424;padding:15px 20px;border-top:1px solid #1a2a44">
+    <table role="presentation" width="100%" align="center">
+      <tr><td align="center">
+        <table role="presentation">
+          <tr>
+            <td style="padding-right:10px">
+              <div style="background-color:#000;padding:6px 10px;border-radius:3px">
+                <span style="color:#4da3ff;font-size:10px;font-weight:700">LUMU INCIDENT HANDLER</span>
+              </div>
+            </td>
+            <td>
+              <div style="color:#fff;font-size:9px;line-height:1.4">Alerta de inteligência de ameaças gerado automaticamente via Lumu Defender API.</div>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+
+</body>
+</html>

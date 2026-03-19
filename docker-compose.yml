@@ -1,0 +1,33 @@
+services:
+  lumu-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumu-monitor
+    restart: unless-stopped
+    # Security: Drop all capabilities, prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Security: Mount the .env file instead of hardcoding environments
+    env_file:
+      - .env
+    # Persistence: Define volume for data directory
+    volumes:
+      - lumu-data:/app/data
+    # Use tmpfs for /tmp to support read-only root filesystem
+    tmpfs:
+      - /tmp
+    # Prevent the container from writing to the filesystem
+    read_only: true
+    # Logging configuration to prevent unbounded growth
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  lumu-data:
+    driver: local

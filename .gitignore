@@ -1,0 +1,35 @@
+# Environment and Virtual Environments
+.env
+venv/
+__pycache__/
+*.pyc
+
+# IDE and Project Workspace
+*.code-workspace
+.vscode/
+.idea/
+
+# Debugging and Internal Data
+debug_*.py
+_*.py
+_*.json
+data/
+/*.html
+**/*.log
+src/*_new_method.py
+
+# Testing and Proofs
+test_*.py
+poc_*.py
+
+# Ignore directories
+.agent/
+.gemini/
+specs/
+
+# Ignore all .md files by default
+**/*.md
+
+# Exceptions to keep
+!/README.md
+!**/docs/**/*.md
