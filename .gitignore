@@ -25,6 +25,7 @@ poc_*.py
 # Ignore directories
 .agent/
 .gemini/
+docs/maestro/
 specs/
 
 # Ignore all .md files by default
