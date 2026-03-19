@@ -22,12 +22,6 @@ src/*_new_method.py
 test_*.py
 poc_*.py
 
-# Ignore directories
-.agent/
-.gemini/
-docs/maestro/
-specs/
-
 # Ignore all .md files by default
 **/*.md
 
