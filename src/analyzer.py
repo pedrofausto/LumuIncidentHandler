@@ -5,6 +5,7 @@ import os
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from dateutil import parser
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,12 @@ class StixSighting:
     count: int
 
 @dataclass
+class AffectedEndpoint:
+    name: str
+    first_contact: str
+    last_contact: str
+
+@dataclass
 class IncidentEvent:
     incident_uuid: str
     title: str
@@ -46,8 +53,14 @@ class IncidentEvent:
     # Fallback: raw adversary hostnames/IPs
     adversaries: List[str] = field(default_factory=list)
     details: str = ""
-    affected_endpoints: List[str] = field(default_factory=list)
+    affected_endpoints: List[AffectedEndpoint] = field(default_factory=list)
     tlp: str = "TLP: RED"
+    disseminated: bool = False
+    triggered_integrations: List[str] = field(default_factory=list)
+    dissemination_time: Optional[str] = None
+    dissemination_latency: Optional[str] = None
+    mtt_response: Optional[str] = None
+    mtt_resolution: Optional[str] = None
 
 
 class Analyzer:
@@ -106,12 +119,87 @@ class Analyzer:
         except (IOError, OSError) as e:
             logger.error(f"Failed to save state file {self._state_file}: {e}")
 
+    def _calculate_latency(self, start_iso: str, end_iso: str) -> Optional[str]:
+        if not start_iso or not end_iso: return None
+        try:
+            s_ts = parser.parse(start_iso)
+            e_ts = parser.parse(end_iso)
+            
+            # Ensure both are timezone aware for comparison
+            if s_ts.tzinfo is None:
+                s_ts = s_ts.replace(tzinfo=timezone.utc)
+            if e_ts.tzinfo is None:
+                e_ts = e_ts.replace(tzinfo=timezone.utc)
+                
+            diff = e_ts - s_ts
+            seconds = int(diff.total_seconds())
+            if seconds < 0: return "0s"
+            h, r = divmod(seconds, 3600)
+            m, s = divmod(r, 60)
+            if h > 0: return f"{h}h {m}m {s}s"
+            if m > 0: return f"{m}m {s}s"
+            return f"{s}s"
+        except: return None
+
+    def _merge_workstations(self, sources: List[List[Dict[str, Any]]]) -> List[AffectedEndpoint]:
+        """
+        Deduplicates and merges assets from multiple sources.
+        Uses a tiered deduplication key: hostname (if present) OR ip_address.
+        Merges timelines: first_contact = min, last_contact = max.
+        """
+        merged: Dict[str, AffectedEndpoint] = {}
+        merged_dts: Dict[str, Dict[str, Any]] = {}
+        
+        for source in sources:
+            if not source:
+                continue
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                
+                # Tiered key: hostname (endpointName) OR ip_address (endpointIp)
+                name = item.get('endpointName') or item.get('endpointIp')
+                if not name:
+                    continue
+                
+                # Try various timestamp fields
+                raw_ts = item.get('datetime') or item.get('timestamp') or item.get('firstContact') or item.get('lastContact')
+                ts_dt = None
+                if raw_ts:
+                    try:
+                        ts_dt = parser.parse(raw_ts)
+                        if ts_dt.tzinfo is None:
+                            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        ts_dt = None
+
+                if name not in merged:
+                    merged[name] = AffectedEndpoint(
+                        name=name,
+                        first_contact=raw_ts or '',
+                        last_contact=raw_ts or ''
+                    )
+                    # Store parsed objects for comparison in a temporary dict
+                    merged_dts[name] = {'first': ts_dt, 'last': ts_dt}
+                elif ts_dt:
+                    # Update first_contact if ts_dt is earlier
+                    if not merged_dts[name]['first'] or (ts_dt < merged_dts[name]['first']):
+                        merged_dts[name]['first'] = ts_dt
+                        merged[name].first_contact = raw_ts
+                    # Update last_contact if ts_dt is later
+                    if not merged_dts[name]['last'] or (ts_dt > merged_dts[name]['last']):
+                        merged_dts[name]['last'] = ts_dt
+                        merged[name].last_contact = raw_ts        
+        return sorted(list(merged.values()), key=lambda x: x.name)
+
     def evaluate_incidents(self,
                            raw_incidents: List[Dict[str, Any]],
                            stix_data_map: Dict[str, Dict[str, Any]] = None,
-                           details_map: Dict[str, Dict[str, Any]] = None) -> List[IncidentEvent]:
+                           details_map: Dict[str, Dict[str, Any]] = None,
+                           contacts_map: Dict[str, List[Dict[str, Any]]] = None) -> List[IncidentEvent]:
         stix_data_map = stix_data_map or {}
         details_map = details_map or {}
+        contacts_map = contacts_map or {}
         incident_events: List[IncidentEvent] = []
 
         for inc in raw_incidents:
@@ -131,16 +219,19 @@ class Analyzer:
             severity   = inc.get('severity', 'High')
             status     = inc.get('status', 'open')
 
-            first_contact = inc.get('firstContact') or inc.get('timestamp', '')
+            # Metric Base Timestamps
+            # Open Since (Incident Creation in Lumu)
+            open_since = inc.get('timestamp', '') 
+            # First Threat Contact (Actual sighting)
+            first_contact = inc.get('firstContact') or open_since
             last_contact  = inc.get('lastContact')  or inc.get('statusTimestamp', '')
-            endpoints     = inc.get('totalEndpoints') or inc.get('contacts', 0)
+            
+            # API reported count
+            endpoints_count = inc.get('totalEndpoints') or inc.get('contacts', 0)
 
             # ── Parse STIX bundle ─────────────────────────────────────────
             stix = stix_data_map.get(uuid, {})
             objects = stix.get('objects', [])
-
-            # Build lookup by id so relationships can be resolved
-            obj_by_id: Dict[str, Dict] = {o['id']: o for o in objects if 'id' in o}
 
             stix_indicators: List[StixIndicator] = []
             stix_malware:    List[StixMalware]   = []
@@ -149,12 +240,9 @@ class Analyzer:
 
             for obj in objects:
                 t = obj.get('type')
-
                 if t == 'marking-definition' and obj.get('definition_type') == 'tlp':
                     tlp_def = obj.get('definition', {}).get('tlp', '').upper()
-                    if tlp_def:
-                        tlp_value = f"TLP: {tlp_def}"
-
+                    if tlp_def: tlp_value = f"TLP: {tlp_def}"
                 elif t == 'indicator':
                     stix_indicators.append(StixIndicator(
                         name=obj.get('name', ''),
@@ -163,13 +251,11 @@ class Analyzer:
                         indicator_types=obj.get('indicator_types', []),
                         valid_from=obj.get('valid_from', '')
                     ))
-
                 elif t == 'malware':
                     stix_malware.append(StixMalware(
                         name=obj.get('name', ''),
                         is_family=obj.get('is_family', False)
                     ))
-
                 elif t == 'sighting' and stix_sighting is None:
                     stix_sighting = StixSighting(
                         first_seen=obj.get('first_seen', ''),
@@ -177,20 +263,81 @@ class Analyzer:
                         count=obj.get('count', 1)
                     )
 
-            # ── Parse Incident Details (Endpoints) ────────────────────────
-            affected_endpoints = []
+            # ── Parse Incident Details (Endpoints & Metrics) ──────────────
+            affected_endpoints: List[AffectedEndpoint] = []
+            disseminated = False
+            triggered_integrations = []
+            dissemination_time = None
+            
+            # User Definitions:
+            # MTTD (Mean Time to Disseminate): Open Since (Creation) -> Automated Response
+            # Time to Respond: First Threat Contact -> Automated Response
+            # Time to Resolution: First Threat Contact -> Closed
+            mtt_dissemination = None
+            mtt_response = None
+            mtt_resolution = None
+
             det = details_map.get(uuid, {})
             if det:
-                # Collect from first and last contact as a minimum
-                f_det = det.get('firstContactDetails', {})
-                l_det = det.get('lastContactDetails', {})
+                # 1. Extract unique endpoints with their timelines
+                api_contacts_data = contacts_map.get(uuid, [])
+                api_contacts_list = []
+                if isinstance(api_contacts_data, dict):
+                    api_contacts_list = api_contacts_data.get('contacts') or api_contacts_data.get('items') or []
+                elif isinstance(api_contacts_data, list):
+                    api_contacts_list = api_contacts_data
+
+                det_contacts = det.get('contacts', [])
+                first_contact_details = det.get('firstContactDetails', {})
+                last_contact_details = det.get('lastContactDetails', {})
+
+                sources = [
+                    api_contacts_list if isinstance(api_contacts_list, list) else [],
+                    det_contacts if isinstance(det_contacts, list) else [],
+                    [first_contact_details] if first_contact_details else [],
+                    [last_contact_details] if last_contact_details else []
+                ]
                 
-                names = set()
-                for d in [f_det, l_det]:
-                    name = d.get('endpointName') or d.get('endpointIp')
-                    if name:
-                        names.add(name)
-                affected_endpoints = sorted(list(names))
+                affected_endpoints = self._merge_workstations(sources)
+
+                # 2. Parse Metrics from Actions
+                actions = det.get('actions', [])
+                
+                # Automated Response (Dissemination)
+                response_actions = [a for a in actions if a.get('action') == 'response']
+                if response_actions:
+                    disseminated = True
+                    unique_integrations = set()
+                    first_resp_time = None
+                    
+                    for ra in response_actions:
+                        data = ra.get('data', {})
+                        ts = data.get('timestamp')
+                        if ts:
+                            if first_resp_time is None or ts < first_resp_time:
+                                first_resp_time = ts
+                        
+                        int_type = data.get('integrationType')
+                        if int_type:
+                            # Format: replace _ with space, capitalize
+                            formatted_int = int_type.replace('_', ' ').title()
+                            unique_integrations.add(formatted_int)
+                    
+                    triggered_integrations = sorted(list(unique_integrations))
+                    dissemination_time = first_resp_time
+                    
+                    # MTTD (Mean Time to Disseminate): Open Since (Creation) -> Response
+                    mtt_dissemination = self._calculate_latency(open_since, dissemination_time)
+                    # Time to Respond: First Threat Contact (Sighting) -> Response
+                    mtt_response = self._calculate_latency(first_contact, dissemination_time)
+
+                # Closed (Resolution)
+                close_action = next((a for a in actions if a.get('action') == 'close'), None)
+                if close_action:
+                    # Time to Resolution: First Threat Contact -> Close
+                    mtt_resolution = self._calculate_latency(first_contact, close_action.get('datetime', ''))
+                else:
+                    mtt_resolution = None
 
             event = IncidentEvent(
                 incident_uuid=uuid,
@@ -201,14 +348,20 @@ class Analyzer:
                 status=status,
                 first_contact=first_contact,
                 last_contact=last_contact,
-                endpoints_affected=endpoints,
+                endpoints_affected=endpoints_count,
                 stix_indicators=stix_indicators,
                 stix_malware=stix_malware,
                 stix_sighting=stix_sighting,
                 adversaries=adversaries,
                 details=inc.get('description', title),
                 affected_endpoints=affected_endpoints,
-                tlp=tlp_value
+                tlp=tlp_value,
+                disseminated=disseminated,
+                triggered_integrations=triggered_integrations,
+                dissemination_time=dissemination_time,
+                dissemination_latency=mtt_dissemination,
+                mtt_response=mtt_response,
+                mtt_resolution=mtt_resolution
             )
 
             incident_events.append(event)

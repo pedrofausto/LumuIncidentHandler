@@ -235,6 +235,29 @@ class LumuSession:
         response.raise_for_status()
         return response.json()
 
+    async def get_incident_contacts(self, company_key: str, incident_uuid: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all contacts (endpoints) for a specific incident.
+        """
+        url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/contacts"
+        params = {"key": company_key}
+        response = await self.client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get('items', [])
+        return []
+
+    async def get_secops_incident_details(self, company_uuid: str, incident_uuid: str) -> Dict[str, Any]:
+        """
+        Fetch rich incident details including all affected workstations.
+        Endpoint: GET https://managed.lumu.io/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/details
+        """
+        endpoint = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/details"
+        return await self.get_with_auth(endpoint)
+
     async def get_incident_stix(self, company_id: str, incident_uuid: str) -> Dict[str, Any]:
         """
         Fetch STIX information for an incident.

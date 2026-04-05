@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     
     # New Lumu API Endpoints
     lumu_defender_url: str = Field("https://defender.lumu.io", description="Base URL for Lumu Defender API")
-    lumu_defender_key: Optional[str] = Field(None, description="Defender API Key used as 'key' query param for incident endpoints")
+    lumu_defender_key: Optional[SecretStr] = Field(None, description="Defender API Key used as 'key' query param for incident endpoints")
 
     # Customer to monitor — single company UUID
     customer_uuid: str = Field(..., description="The UUID of the customer/tenant to monitor for incidents")

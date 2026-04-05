@@ -87,7 +87,7 @@ async def run_loop():
                     notifier=notifier,
                     tenant_uuid=settings.customer_uuid,
                     tenant_name=settings.customer_name,
-                    company_key=settings.lumu_defender_key,
+                    company_key=settings.lumu_defender_key.get_secret_value() if settings.lumu_defender_key else None,
                 )
             except Exception as e:
                 logger.error(f"Critical error during polling cycle: {str(e)}")

@@ -1,0 +1,16 @@
+ENGLISH_MAP = {
+    "severity": "Severity",
+    "detected_incidents": "Detected Incidents",
+    "intelligence_dissemination": "Intelligence Dissemination",
+    "affected_workstation_inventory": "Affected Workstation Inventory",
+    "first_contact": "First Contact",
+    "last_contact": "Last Contact",
+    "incident_title": "Incident Title",
+    "type_adversary": "Type / Adversary",
+    "workstations_endpoints": "Workstations / Endpoints",
+    "stix_indicators": "STIX Indicators",
+    "threat_summary": "Threat Summary",
+    "threat_intelligence_deep_dive": "Threat Intelligence Deep-Dive",
+    "hostname": "Hostname",
+    "threat_intel_footer": "Threat intelligence alert automatically generated via Lumu Defender API.",
+    }

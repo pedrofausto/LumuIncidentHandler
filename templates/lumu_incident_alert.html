@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -16,7 +16,7 @@
       <tr>
         <td width="60%">
           <div style="color:#8aa3c7;font-size:10px;font-family:'Courier New',monospace">
-            <div><strong>Data/Hora:</strong> {{ date_time }}</div>
+            <div><strong>Date/Time:</strong> {{ date_time }}</div>
             <div><strong>Monitor ID:</strong> {{ monitor_id }}</div>
             <div><strong>Tenant:</strong> {{ tenant_name }}</div>
           </div>
@@ -33,19 +33,47 @@
 
   <!-- TITLE BAR -->
   <tr><td style="background-color:#0b1424;padding:15px 20px;border-bottom:1px solid #1c2a44">
-    <div style="color:#b8d4ff;font-size:16px;font-weight:600">[Lumu Alert] Detecção de Incidentes de Segurança</div>
-    <div style="color:#7ea2d6;font-size:11px;margin-top:5px">Lumu Defender API · Threat Intelligence Correlation · Status: {{ incident_count }} Novo(s) Incidente(s)</div>
+    <div style="color:#b8d4ff;font-size:16px;font-weight:600">[Lumu Alert] Security Incident Detection</div>
+    <div style="color:#7ea2d6;font-size:11px;margin-top:5px">Lumu Defender API · Threat Intelligence Correlation · Status: {{ incident_count }} New Incident(s)</div>
   </td></tr>
 
   <!-- BODY -->
   <tr><td style="padding:20px">
+
+    <!-- OPERATIONAL METRICS HEADER -->
+    <div style="background-color:#0b1424;border:1px solid #1c2a44;border-radius:6px;padding:15px;margin-bottom:20px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td width="20%" style="border-right:1px solid #1c2a44;padding-right:10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:3px">Mean Time to Disseminate (MTTD)</div>
+            <div style="color:#e6f1ff;font-size:12px;font-weight:700">{{ mtt_dissemination }}</div>
+          </td>
+          <td width="20%" style="border-right:1px solid #1c2a44;padding:0 10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:3px">Time to Respond</div>
+            <div style="color:#e6f1ff;font-size:12px;font-weight:700">{{ mtt_response }}</div>
+          </td>
+          <td width="20%" style="border-right:1px solid #1c2a44;padding:0 10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:3px">Time to Resolution (TTR)</div>
+            <div style="color:#e6f1ff;font-size:12px;font-weight:700">{{ mtt_resolution }}</div>
+          </td>
+          <td width="20%" style="border-right:1px solid #1c2a44;padding:0 10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:3px">First Contact</div>
+            <div style="color:#e6f1ff;font-size:11px;font-weight:600">{{ first_contact }}</div>
+          </td>
+          <td width="20%" style="padding-left:10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:3px">Last Contact</div>
+            <div style="color:#e6f1ff;font-size:11px;font-weight:600">{{ last_contact }}</div>
+          </td>
+        </tr>
+      </table>
+    </div>
 
     <!-- SUMMARY -->
     <table role="presentation" width="100%" style="margin-bottom:20px">
       <tr>
         <td style="vertical-align:top">
           <div style="background-color:#0b1424;border:1px solid #1c2a44;border-left:3px solid {{ stripe_color }};border-radius:6px;padding:15px">
-            <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 10px">RESUMO DA AMEAÇA</div>
+            <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 10px">{{ l10n.threat_summary | upper }}</div>
             <div style="color:#c6dcff;font-size:12px;line-height:1.6">
               {{ incident_summary }}
             </div>
@@ -54,27 +82,93 @@
       </tr>
     </table>
 
+    {% if event.disseminated %}
+    <!-- DISSEMINATION INFO -->
+    <div style="background-color:#0b1424;border:1px solid #1c2a44;border-left:3px solid #27ae60;border-radius:6px;padding:15px;margin-bottom:20px">
+      <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 12px;letter-spacing:.5px">
+        <span style="color:#2ecc71">◢</span> {{ l10n.intelligence_dissemination | upper }}
+      </div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td width="40%" style="padding:0 10px 0 0;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:5px">{{ l10n.automated_response_time }}</div>
+            <div style="color:#e6f1ff;font-size:11px;font-weight:600">{{ fmt_ts(event.dissemination_time) }}</div>
+          </td>
+          <td width="60%" style="padding:0 0 0 10px;vertical-align:top">
+            <div style="color:#8aa3c7;font-size:9px;text-transform:uppercase;margin-bottom:5px">{{ l10n.disseminated_to }}</div>
+            <div style="color:#e6f1ff;font-size:11px;font-weight:600">
+              {{ event.triggered_integrations | join(', ') }}
+            </div>
+          </td>
+        </tr>
+      </table>
+    </div>
+    {% endif %}
+
     <!-- INCIDENT LIST -->
     <div style="background-color:#0b1424;border:1px solid #1c2a44;border-radius:6px;padding:15px;margin-bottom:20px">
       <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 12px;letter-spacing:.5px">
-        <span style="color:#79c0ff">◢</span> INCIDENTES DETECTADOS
+        <span style="color:#79c0ff">◢</span> {{ l10n.detected_incidents | upper }}
       </div>
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
         <tr style="border-bottom:1px solid #1c2a44">
-          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Severidade</th>
-          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Título do Incidente</th>
-          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Tipo / Adversário</th>
-          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Endpoints</th>
-          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">Indicadores STIX</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.severity }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.incident_title }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.type_adversary }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.workstations_endpoints }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.stix_indicators }}</th>
         </tr>
-        {{ incident_rows }}
+        {{ incident_rows | safe }}
       </table>
     </div>
+
+    <!-- THREAT INTELLIGENCE DEEP-DIVE -->
+    {% if stix_indicators %}
+    <div style="background-color:#0b1424;border:1px solid #1c2a44;border-radius:6px;padding:15px;margin-bottom:20px">
+      <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 12px;letter-spacing:.5px">
+        <span style="color:#e67e22">◢</span> {{ l10n.threat_intelligence_deep_dive | upper }}
+      </div>
+      {% for ind in stix_indicators %}
+      <div style="background-color:#112644;border:1px solid #1c2a44;border-radius:4px;padding:10px;margin-bottom:10px">
+        <div style="color:#79c0ff;font-size:11px;font-weight:600">{{ ind.name }}</div>
+        {% if ind.description %}
+        <div style="color:#8aa3c7;font-size:10px;margin-top:5px">{{ ind.description }}</div>
+        {% endif %}
+        {% if ind.pattern %}
+        <div style="color:#5b84b8;font-size:9px;margin-top:8px;font-family:'Courier New',monospace;word-break:break-all">Pattern: {{ ind.pattern }}</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- AFFECTED WORKSTATION INVENTORY -->
+    {% if affected_endpoints %}
+    <div style="background-color:#0b1424;border:1px solid #1c2a44;border-radius:6px;padding:15px;margin-bottom:20px">
+      <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 12px;letter-spacing:.5px">
+        <span style="color:#79c0ff">◢</span> {{ l10n.affected_workstation_inventory | upper }}
+      </div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
+        <tr style="border-bottom:1px solid #1c2a44">
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.hostname }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.first_contact }}</th>
+          <th align="left" style="color:#5b84b8;font-size:9px;text-transform:uppercase;padding:8px 5px">{{ l10n.last_contact }}</th>
+        </tr>
+        {% for ep in affected_endpoints %}
+        <tr style="border-bottom:1px solid #112644">
+          <td style="padding:8px 5px;color:#c6dcff;font-size:10px;font-weight:600">{{ ep.name }}</td>
+          <td style="padding:8px 5px;color:#8aa3c7;font-size:10px">{{ fmt_ts(ep.first_contact) }}</td>
+          <td style="padding:8px 5px;color:#8aa3c7;font-size:10px">{{ fmt_ts(ep.last_contact) }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
 
     <!-- ACTIONS -->
     <div style="background-color:#0b1424;border:1px solid #1a2a44;border-radius:6px;padding:15px;margin-bottom:20px">
       <div style="color:#e6f1ff;font-size:12px;font-weight:700;text-transform:uppercase;margin:0 0 15px;letter-spacing:.5px">
-        <span style="color:#79c0ff">◢</span> PRÓXIMOS PASSOS RECOMENDADOS
+        <span style="color:#79c0ff">◢</span> {{ l10n.recommended_next_steps | upper }}
       </div>
 
       <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:12px">
@@ -86,7 +180,7 @@
           </td>
           <td>
             <div style="color:#c6dcff;font-size:11px;line-height:1.6">
-              <strong>Isolar Endpoints:</strong> Revise os {{ total_endpoints }} endpoints afetados e considere o isolamento preventivo caso a severidade seja Crítica ou Alta.
+              <strong>Isolate Endpoints:</strong> Review the {{ total_endpoints }} affected endpoints and consider preventive isolation if severity is Critical or High.
             </div>
           </td>
         </tr>
@@ -101,7 +195,7 @@
           </td>
           <td>
             <div style="color:#c6dcff;font-size:11px;line-height:1.6">
-              <strong>Bloqueio de Indicadores:</strong> Aplique os indicadores STIX listados em seus firewalls, proxies ou EDRs para conter a propagação.
+              <strong>Indicator Blocking:</strong> Apply the listed STIX indicators to your firewalls, proxies, or EDRs to contain propagation.
             </div>
           </td>
         </tr>
@@ -116,7 +210,7 @@
           </td>
           <td>
             <div style="color:#c6dcff;font-size:11px;line-height:1.6">
-              <strong>Investigação Lumu:</strong> Acesse o portal Lumu para visualizar a linha do tempo completa do incidente e as recomendações de mitigação específicas.
+              <strong>Lumu Investigation:</strong> Access the Lumu portal to view the full incident timeline and specific mitigation recommendations.
             </div>
           </td>
         </tr>
@@ -137,7 +231,7 @@
               </div>
             </td>
             <td>
-              <div style="color:#fff;font-size:9px;line-height:1.4">Alerta de inteligência de ameaças gerado automaticamente via Lumu Defender API.</div>
+              <div style="color:#fff;font-size:9px;line-height:1.4">{{ l10n.threat_intel_footer }}</div>
             </td>
           </tr>
         </table>
