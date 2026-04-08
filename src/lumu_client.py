@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import logging
 import time
@@ -13,10 +14,22 @@ class LumuSession:
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=False)
         self.bearer_token: Optional[str] = None
         self.token_expiry: float = 0
+        self._auth_lock = asyncio.Lock()
         
-    async def authenticate(self) -> None:
+    async def _ensure_authenticated(self) -> None:
         """
-        Authenticates against the Lumu API and stores the Bearer token securely in-memory.
+        Checks if the token is missing or expired, and re-authenticates if necessary.
+        """
+        # Buffer of 60 seconds to prevent race conditions during expiry
+        if not self.bearer_token or time.time() > (self.token_expiry - 60):
+            async with self._auth_lock:
+                # Re-check after acquiring lock
+                if not self.bearer_token or time.time() > (self.token_expiry - 60):
+                    await self.authenticate_locked()
+
+    async def authenticate_locked(self) -> None:
+        """
+        Internal method to perform authentication. Assumes lock is already held.
         """
         login_url = "/api/msp/users/sign_in"
         payload = {
@@ -45,13 +58,12 @@ class LumuSession:
         self.token_expiry = time.time() + 3600 
         logger.info("Authentication successful. Token secured in-memory.")
 
-    async def _ensure_authenticated(self) -> None:
+    async def authenticate(self) -> None:
         """
-        Checks if the token is missing or expired, and re-authenticates if necessary.
+        Public authentication method.
         """
-        # Buffer of 60 seconds to prevent race conditions during expiry
-        if not self.bearer_token or time.time() > (self.token_expiry - 60):
-            await self.authenticate()
+        async with self._auth_lock:
+            await self.authenticate_locked()
 
     async def get_with_auth(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """

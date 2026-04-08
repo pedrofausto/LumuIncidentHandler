@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import sys
+import dataclasses
+from datetime import datetime, timezone
+from typing import Dict, Any, List
 from .config import get_settings
 from .lumu_client import LumuSession
 from .analyzer import Analyzer
-from .notifier import Notifier
+from .wazuh_client import WazuhClient
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -13,7 +16,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lumu_monitor")
 
-async def monitor_tenant(client: LumuSession, analyzer: Analyzer, notifier: Notifier, tenant_uuid: str, tenant_name: str, company_key: str):
+async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str) -> Dict[str, Any]:
+    """
+    Fetches STIX and details for a single incident concurrently.
+    """
+    try:
+        stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
+        details_task = client.get_incident_details(company_key, inc_uuid)
+        stix, details = await asyncio.gather(stix_task, details_task)
+        return {'uuid': inc_uuid, 'stix': stix, 'details': details}
+    except Exception as e:
+        logger.debug(f"Intelligence enrichment failed for incident {inc_uuid}: {e}")
+        return {'uuid': inc_uuid, 'stix': {}, 'details': {}}
+
+async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhClient, tenant_uuid: str, tenant_name: str, company_key: str):
     """
     Monitors a single tenant for security incidents and fetches STIX intelligence.
     """
@@ -30,35 +46,43 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, notifier: Noti
             logger.info(f"No active incidents found for tenant '{tenant_name}'.")
             return
 
-        logger.info(f"Found {len(raw_incidents)} active incident(s). Fetching intelligence...")
+        # 2. Deduplication: only process incidents not already in analyzer state
+        new_raw_incidents = [inc for inc in raw_incidents if (inc.get('uuid') or inc.get('id')) not in analyzer._alerted_incidents]
 
-        stix_data_map = {}
-        details_map = {}
-        for inc in raw_incidents:
-            inc_uuid = inc.get('uuid') or inc.get('id')
-            if inc_uuid:
-                try:
-                    # Fetch STIX
-                    stix_data = await client.get_incident_stix(tenant_uuid, inc_uuid)
-                    stix_data_map[inc_uuid] = stix_data
+        if not new_raw_incidents:
+            logger.info(f"All {len(raw_incidents)} active incident(s) for '{tenant_name}' have already been alerted.")
+            return
 
-                    # Fetch Details (for endpoint names)
-                    details = await client.get_incident_details(company_key, inc_uuid)
-                    details_map[inc_uuid] = details
-                except Exception as e:
-                    logger.debug(f"Intelligence enrichment failed for incident {inc_uuid}: {e}")
+        logger.info(f"Found {len(new_raw_incidents)} new incident(s). Fetching intelligence concurrently...")
 
-        all_incident_events = analyzer.evaluate_incidents(raw_incidents, stix_data_map, details_map)
+        # 3. Concurrent Enrichment
+        tasks = [enrich_incident(client, tenant_uuid, company_key, inc.get('uuid') or inc.get('id')) for inc in new_raw_incidents]
+        enrichment_results = await asyncio.gather(*tasks)
 
-        # 4. Filter for new (not yet alerted) incidents only
+        stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
+        details_map = {res['uuid']: res['details'] for res in enrichment_results}
+
+        # 4. Evaluate and filter
+        all_incident_events = analyzer.evaluate_incidents(new_raw_incidents, stix_data_map, details_map)
         new_events = analyzer.filter_new_incidents(all_incident_events)
 
-        # 5. Fire notification if new incidents detected
         if new_events:
             logger.warning(f"Alerting on {len(new_events)} new incident(s) for '{tenant_name}'.")
-            notifier.send_incident_alert(new_events, tenant_uuid, tenant_name)
+            
+            # 5. Dispatch to Wazuh
+            for event in new_events:
+                try:
+                    event_dict = dataclasses.asdict(event)
+                    # OpenSearch TSDB heavily relies on @timestamp
+                    event_dict["@timestamp"] = event.first_contact or event.last_contact or datetime.now(timezone.utc).isoformat()
+                    # Inject generic tenant context
+                    event_dict["customer_name"] = tenant_name
+                    event_dict["customer_uuid"] = tenant_uuid
+                    await wazuh.send_incident(event_dict)
+                except Exception as e:
+                    logger.error(f"Failed to send incident {event.incident_uuid} to Wazuh: {e}")
         else:
-            logger.info(f"All {len(all_incident_events)} active incident(s) for '{tenant_name}' have already been alerted.")
+            logger.info(f"No new incidents to alert for '{tenant_name}' after filtering.")
 
     except Exception as e:
         logger.error(f"Error processing incidents for tenant {tenant_uuid}: {str(e)}")
@@ -68,7 +92,7 @@ async def run_loop():
     settings = get_settings()
     client = LumuSession()
     analyzer = Analyzer()
-    notifier = Notifier()
+    wazuh = WazuhClient()
 
     interval_seconds = settings.polling_interval_minutes * 60
 
@@ -84,7 +108,7 @@ async def run_loop():
                 await monitor_tenant(
                     client=client,
                     analyzer=analyzer,
-                    notifier=notifier,
+                    wazuh=wazuh,
                     tenant_uuid=settings.customer_uuid,
                     tenant_name=settings.customer_name,
                     company_key=settings.lumu_defender_key.get_secret_value() if settings.lumu_defender_key else None,
@@ -99,6 +123,8 @@ async def run_loop():
         logger.info("Monitor interrupted. Shutting down gracefully...")
     finally:
         await client.close()
+        await wazuh.close()
+
 
 
 if __name__ == "__main__":

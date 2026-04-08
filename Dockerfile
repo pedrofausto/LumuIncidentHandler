@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code securely
 COPY src/ ./src/
-COPY lumu_alert_mockup.html .
 
 # Change ownership of the application directory to the non-root user
 RUN mkdir -p /app/data && chown -R appuser:appuser /app/data

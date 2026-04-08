@@ -20,22 +20,16 @@ class Settings(BaseSettings):
     customer_uuid: str = Field(..., description="The UUID of the customer/tenant to monitor for incidents")
     customer_name: str = Field("Unknown Customer", description="Human-readable name for the customer (used in alerts)")
 
-
-    # SMTP Configuration
-    smtp_host: str = Field(..., description="The SMTP server address")
-    smtp_port: int = Field(587, description="The SMTP server port (usually 587 for TLS or 465 for SSL)")
-    smtp_user: str = Field(..., description="The SMTP username")
-    smtp_pass: SecretStr = Field(..., description="The SMTP password")
-    smtp_from_email: EmailStr = Field(..., description="The email address to send alerts from")
-    
-    # Alerting
-    alert_to_email: EmailStr = Field(..., description="The sysadmin email address that receives alerts")
-    
     # Orchestration
     polling_interval_minutes: int = Field(5, description="Frequency of Lumu polling in minutes")
 
     # Persistence
-    alert_state_file: str = Field("data/alerts.json", description="Path to the local JSON file for tracking notified incidents")
+    alert_state_file: str = Field("data/sent_incidents.json", description="Path to the local JSON file for tracking notified incidents")
+
+    # Wazuh Indexer Configuration
+    indexer_url: str = Field(..., description="The Wazuh Indexer endpoint for incident ingestion")
+    indexer_username: str = Field("admin", description="The username for Wazuh Indexer authentication")
+    indexer_password: SecretStr = Field(..., description="The password for Wazuh Indexer authentication")
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,0 +1,9 @@
+server.host: 0.0.0.0
+server.port: 5601
+opensearch.hosts: ["http://wazuh-indexer:9200"]
+opensearch.ssl.verificationMode: none
+opensearch.requestHeadersWhitelist: [ authorization,securitytenant ]
+opensearch_dashboards.index: .opensearch_dashboards
+opensearch.username: admin
+opensearch.password: admin
+# Wazuh plugin is configured separately in wazuh.yml
