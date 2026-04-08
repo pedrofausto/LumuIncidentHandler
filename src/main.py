@@ -18,16 +18,29 @@ logger = logging.getLogger("lumu_monitor")
 
 async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str) -> Dict[str, Any]:
     """
-    Fetches STIX and details for a single incident concurrently.
+    Fetches STIX, details, summary context, and external-articles context for a single incident concurrently.
     """
     try:
         stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
         details_task = client.get_incident_details(company_key, inc_uuid)
-        stix, details = await asyncio.gather(stix_task, details_task)
-        return {'uuid': inc_uuid, 'stix': stix, 'details': details}
+        summary_task = client.get_incident_context_summary(tenant_uuid, inc_uuid)
+        articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
+        
+        stix, details, summary, articles = await asyncio.gather(
+            stix_task, details_task, summary_task, articles_task, return_exceptions=True
+        )
+        
+        # Gracefully handle exceptions when specific APIs return 404 or fail
+        return {
+            'uuid': inc_uuid, 
+            'stix': stix if not isinstance(stix, Exception) else {}, 
+            'details': details if not isinstance(details, Exception) else {},
+            'summary': summary if not isinstance(summary, Exception) else {},
+            'articles': articles if not isinstance(articles, Exception) else []
+        }
     except Exception as e:
         logger.debug(f"Intelligence enrichment failed for incident {inc_uuid}: {e}")
-        return {'uuid': inc_uuid, 'stix': {}, 'details': {}}
+        return {'uuid': inc_uuid, 'stix': {}, 'details': {}, 'summary': {}, 'articles': []}
 
 async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhClient, tenant_uuid: str, tenant_name: str, company_key: str):
     """
@@ -61,9 +74,17 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
 
         stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
         details_map = {res['uuid']: res['details'] for res in enrichment_results}
+        summary_map = {res['uuid']: res['summary'] for res in enrichment_results}
+        articles_map = {res['uuid']: res['articles'] for res in enrichment_results}
 
         # 4. Evaluate and filter
-        all_incident_events = analyzer.evaluate_incidents(new_raw_incidents, stix_data_map, details_map)
+        all_incident_events = analyzer.evaluate_incidents(
+            new_raw_incidents, 
+            stix_data_map=stix_data_map, 
+            details_map=details_map,
+            summary_map=summary_map,
+            articles_map=articles_map
+        )
         new_events = analyzer.filter_new_incidents(all_incident_events)
 
         if new_events:

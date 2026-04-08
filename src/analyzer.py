@@ -36,6 +36,34 @@ class AffectedEndpoint:
     last_contact: str
 
 @dataclass
+class ThreatIntelArticle:
+    title: str
+    url: str
+    description: str
+    author: str
+
+@dataclass
+class MitreTechnique:
+    technique: str
+    description: str
+    tactics: List[str]
+    platforms: List[str]
+    url: str
+
+@dataclass
+class ContextPlaybook:
+    name: str
+    description: str
+    url: str
+
+@dataclass
+class ContextIOC:
+    parsed_domain: str
+    url: str
+    feed_name: str
+    threat_detail: str
+
+@dataclass
 class IncidentEvent:
     incident_uuid: str
     title: str
@@ -54,6 +82,13 @@ class IncidentEvent:
     adversaries: List[str] = field(default_factory=list)
     details: str = ""
     affected_endpoints: List[AffectedEndpoint] = field(default_factory=list)
+    # Context Enrichment 
+    mitre_techniques: List[MitreTechnique] = field(default_factory=list)
+    related_artifacts: Dict[str, List[str]] = field(default_factory=dict)
+    extracted_iocs: List[ContextIOC] = field(default_factory=list)
+    recommended_playbooks: List[ContextPlaybook] = field(default_factory=list)
+    intelligence_tags: List[str] = field(default_factory=list)
+    intelligence_articles: List[ThreatIntelArticle] = field(default_factory=list)
     tlp: str = "TLP: RED"
     disseminated: bool = False
     triggered_integrations: List[str] = field(default_factory=list)
@@ -196,10 +231,14 @@ class Analyzer:
                            raw_incidents: List[Dict[str, Any]],
                            stix_data_map: Dict[str, Dict[str, Any]] = None,
                            details_map: Dict[str, Dict[str, Any]] = None,
-                           contacts_map: Dict[str, List[Dict[str, Any]]] = None) -> List[IncidentEvent]:
+                           contacts_map: Dict[str, List[Dict[str, Any]]] = None,
+                           summary_map: Dict[str, Dict[str, Any]] = None,
+                           articles_map: Dict[str, List[Dict[str, Any]]] = None) -> List[IncidentEvent]:
         stix_data_map = stix_data_map or {}
         details_map = details_map or {}
         contacts_map = contacts_map or {}
+        summary_map = summary_map or {}
+        articles_map = articles_map or {}
         incident_events: List[IncidentEvent] = []
 
         for inc in raw_incidents:
@@ -262,6 +301,55 @@ class Analyzer:
                         last_seen=obj.get('last_seen', ''),
                         count=obj.get('count', 1)
                     )
+
+            # ── Parse Context Summary ─────────────────────────────────────
+            mitre_techniques: List[MitreTechnique] = []
+            extracted_iocs: List[ContextIOC] = []
+            recommended_playbooks: List[ContextPlaybook] = []
+            intelligence_tags: List[str] = []
+            related_artifacts: Dict[str, List[str]] = {}
+
+            summary = summary_map.get(uuid, {})
+            if summary:
+                add = summary.get('additional', {})
+                for mt in add.get('mitre', []):
+                    mitre_techniques.append(MitreTechnique(
+                        technique=mt.get('technique', ''),
+                        description=mt.get('description', ''),
+                        tactics=mt.get('tactics', []),
+                        platforms=mt.get('platforms', []),
+                        url=mt.get('references', [''])[0] if mt.get('references') else ''
+                    ))
+                
+                related_artifacts = add.get('related_artifacts', {})
+                intelligence_tags = add.get('tags', [])
+
+                for pb in summary.get('playbooks', []):
+                    recommended_playbooks.append(ContextPlaybook(
+                        name=pb.get('name', ''),
+                        description=pb.get('description', ''),
+                        url=pb.get('url', '')
+                    ))
+
+                for ioc in summary.get('iocs', []):
+                    extracted_iocs.append(ContextIOC(
+                        parsed_domain=ioc.get('parsed_domain', ''),
+                        url=ioc.get('url', ''),
+                        feed_name=ioc.get('feed_name', ''),
+                        threat_detail=ioc.get('threat_detail', '')
+                    ))
+
+            # ── Parse Context Articles ────────────────────────────────────
+            intelligence_articles: List[ThreatIntelArticle] = []
+            articles = articles_map.get(uuid, [])
+            if isinstance(articles, list):
+                for art in articles:
+                    intelligence_articles.append(ThreatIntelArticle(
+                        title=art.get('title', ''),
+                        url=art.get('url', ''),
+                        description=art.get('description', ''),
+                        author=art.get('author', '')
+                    ))
 
             # ── Parse Incident Details (Endpoints & Metrics) ──────────────
             affected_endpoints: List[AffectedEndpoint] = []
@@ -355,6 +443,12 @@ class Analyzer:
                 adversaries=adversaries,
                 details=inc.get('description', title),
                 affected_endpoints=affected_endpoints,
+                mitre_techniques=mitre_techniques,
+                related_artifacts=related_artifacts,
+                extracted_iocs=extracted_iocs,
+                recommended_playbooks=recommended_playbooks,
+                intelligence_tags=intelligence_tags,
+                intelligence_articles=intelligence_articles,
                 tlp=tlp_value,
                 disseminated=disseminated,
                 triggered_integrations=triggered_integrations,

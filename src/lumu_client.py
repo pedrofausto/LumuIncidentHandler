@@ -279,5 +279,19 @@ class LumuSession:
         endpoint = f"/intelligence/stix/companies/{company_id}/secops-incident/{incident_uuid}"
         return await self.get_with_auth(endpoint)
 
+    async def get_incident_context_summary(self, company_id: str, incident_uuid: str) -> Dict[str, Any]:
+        """
+        Fetch a rich Context Summary for a security incident containing malware hashes, MITRE mappings, and detailed indicators.
+        """
+        endpoint = f"/intelligence/companies/{company_id}/secops-incidents/{incident_uuid}/context/summary"
+        return await self.get_with_auth(endpoint)
+
+    async def get_incident_external_articles(self, company_id: str, incident_uuid: str) -> List[Dict[str, Any]]:
+        """
+        Fetch external threat intelligence articles correlating with the threat actor or malware family in the incident.
+        """
+        endpoint = f"/intelligence/companies/{company_id}/secops-incidents/{incident_uuid}/context/external-articles"
+        return await self.get_with_auth(endpoint)
+
     async def close(self):
         await self.client.aclose()
