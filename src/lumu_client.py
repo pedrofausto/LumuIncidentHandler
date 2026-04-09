@@ -189,7 +189,7 @@ class LumuSession:
             # Sub-loop for standard pagination within the 30-day chunk
             while True:
                 payload = {
-                    "status": ["open"],
+                    "status": ["open", "closed"],
                     "fromDate": from_str,
                     "toDate": to_str,
                     "pagination": {

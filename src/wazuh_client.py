@@ -14,21 +14,32 @@ class WazuhClient:
 
     async def send_incident(self, json_data: Dict[str, Any]) -> None:
         """
-        Sends enriched incident JSON to the Wazuh Indexer.
+        Sends enriched incident JSON to the Wazuh Indexer via Native Upsert.
         """
         headers = {
             "Content-Type": "application/json"
         }
         
-        logger.info(f"Sending incident to Wazuh Indexer: {self.api_url}")
+        incident_id = json_data.get('incident_uuid')
+        if not incident_id:
+            logger.error("Incident payload missing incident_uuid, cannot upsert.")
+            return
+
+        update_url = f"{self.settings.indexer_url.rstrip('/')}/lumu-incidents-1.x/_update/{incident_id}"
+        payload = {
+            "doc": json_data,
+            "doc_as_upsert": True
+        }
+        
+        logger.info(f"Upserting incident to Wazuh Indexer: {update_url}")
         try:
-            response = await self.client.post(self.api_url, json=json_data, headers=headers, auth=self.auth)
+            response = await self.client.post(update_url, json=payload, headers=headers, auth=self.auth)
             
             if response.status_code not in (200, 201, 202):
-                logger.error(f"Failed to send incident to Wazuh Indexer. Status: {response.status_code}, Response: {response.text}")
+                logger.error(f"Failed to upsert incident to Wazuh Indexer. Status: {response.status_code}, Response: {response.text}")
                 response.raise_for_status()
                 
-            logger.info("Incident successfully sent to Wazuh Indexer.")
+            logger.info("Incident successfully upserted to Wazuh Indexer.")
         except httpx.HTTPError as e:
             logger.error(f"HTTP error occurred while sending incident to Wazuh Indexer: {e}")
             raise

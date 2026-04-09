@@ -101,9 +101,10 @@ class IncidentEvent:
 class Analyzer:
     def __init__(self):
         self._state_file = get_settings().alert_state_file
-        self._alerted_incidents: Dict[str, float] = self._load_state()
+        state_data = self._load_state()
+        self.last_pulled_time: str = state_data.get('last_pulled_time', '')
 
-    def _load_state(self) -> Dict[str, float]:
+    def _load_state(self) -> Dict[str, Any]:
         """Loads the alerted incidents from the JSON state file."""
         # Ensure the base directory is absolute and established at the root
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
@@ -146,7 +147,7 @@ class Analyzer:
             # Secure file permissions (0o600)
             fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as f:
-                json.dump(self._alerted_incidents, f, indent=2)
+                json.dump({"last_pulled_time": self.last_pulled_time}, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
                 
@@ -464,15 +465,17 @@ class Analyzer:
 
     def filter_new_incidents(self, events: List[IncidentEvent]) -> List[IncidentEvent]:
         new_events = []
-        current_time = time.time()
         updated = False
+        new_max_time = self.last_pulled_time
+        
         for e in events:
-            if e.incident_uuid not in self._alerted_incidents:
-                new_events.append(e)
-                self._alerted_incidents[e.incident_uuid] = current_time
+            new_events.append(e)
+            if e.last_contact and e.last_contact > new_max_time:
+                new_max_time = e.last_contact
                 updated = True
         
         if updated:
+            self.last_pulled_time = new_max_time
             self._save_state()
             
         return new_events

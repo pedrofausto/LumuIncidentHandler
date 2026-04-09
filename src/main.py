@@ -59,8 +59,18 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
             logger.info(f"No active incidents found for tenant '{tenant_name}'.")
             return
 
-        # 2. Deduplication: only process incidents not already in analyzer state
-        new_raw_incidents = [inc for inc in raw_incidents if (inc.get('uuid') or inc.get('id')) not in analyzer._alerted_incidents]
+        # 2. Deduplication: only process incidents that are new or updated
+        new_raw_incidents = []
+        for inc in raw_incidents:
+            uuid = inc.get('uuid') or inc.get('id')
+            if not uuid: continue
+            
+            # Use Lumu's last activity time to track updates
+            last_activity = inc.get('lastContact') or inc.get('statusTimestamp') or inc.get('timestamp') or ''
+            
+            # Process if Lumu's timestamp for the event is strictly newer than our global high-water mark
+            if not analyzer.last_pulled_time or last_activity > analyzer.last_pulled_time:
+                new_raw_incidents.append(inc)
 
         if not new_raw_incidents:
             logger.info(f"All {len(raw_incidents)} active incident(s) for '{tenant_name}' have already been alerted.")
@@ -94,8 +104,8 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
             for event in new_events:
                 try:
                     event_dict = dataclasses.asdict(event)
-                    # OpenSearch TSDB heavily relies on @timestamp
-                    event_dict["@timestamp"] = event.first_contact or event.last_contact or datetime.now(timezone.utc).isoformat()
+                    # OpenSearch TSDB heavily relies on @timestamp reflecting ingestion time natively
+                    event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
                     # Inject generic tenant context
                     event_dict["customer_name"] = tenant_name
                     event_dict["customer_uuid"] = tenant_uuid

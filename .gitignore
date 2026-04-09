@@ -28,3 +28,5 @@ poc_*.py
 # Exceptions to keep
 !/README.md
 !**/docs/**/*.md
+test.py
+scratch/force_ingestion.py
