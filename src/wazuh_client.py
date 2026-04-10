@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class WazuhClient:
     def __init__(self):
         self.settings = get_settings()
-        self.api_url = f"{self.settings.indexer_url.rstrip('/')}/lumu-incidents-1.x/_doc"
+        self.api_url = f"{self.settings.indexer_url.rstrip('/')}/{self.settings.indexer_index_name}/_doc"
         self.auth = (self.settings.indexer_username, self.settings.indexer_password.get_secret_value())
         self.client = httpx.AsyncClient(timeout=30.0, verify=self.settings.verify_ssl)
 
@@ -25,7 +25,7 @@ class WazuhClient:
             logger.error("Incident payload missing incident_uuid, cannot upsert.")
             return
 
-        update_url = f"{self.settings.indexer_url.rstrip('/')}/lumu-incidents-1.x/_update/{incident_id}"
+        update_url = f"{self.settings.indexer_url.rstrip('/')}/{self.settings.indexer_index_name}/_update/{incident_id}"
         payload = {
             "doc": json_data,
             "doc_as_upsert": True

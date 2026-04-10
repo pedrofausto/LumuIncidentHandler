@@ -104,6 +104,7 @@ services:
       - INDEXER_URL=https://wazuh.indexer:9200
       - INDEXER_USERNAME=admin
       - INDEXER_PASSWORD=SecretPassword
+      - INDEXER_INDEX_NAME=${INDEXER_INDEX_NAME:-lumu-incidents-1.x}
     volumes:
       - lumu-data:/app/data
     networks:

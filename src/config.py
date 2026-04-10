@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     indexer_url: str = Field(..., description="The Wazuh Indexer endpoint for incident ingestion")
     indexer_username: str = Field("admin", description="The username for Wazuh Indexer authentication")
     indexer_password: SecretStr = Field(..., description="The password for Wazuh Indexer authentication")
+    indexer_index_name: str = Field("lumu-incidents-1.x", description="The name of the index in Wazuh Indexer")
 
     model_config = SettingsConfigDict(
         env_file=".env",
