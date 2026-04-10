@@ -2,7 +2,9 @@ import asyncio
 import httpx
 import logging
 import time
-from typing import Optional, Dict, Any, List
+import os
+import random
+from typing import Optional, Dict, Any, List, Union
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +17,21 @@ class LumuSession:
         self.bearer_token: Optional[str] = None
         self.token_expiry: float = 0
         self._auth_lock = asyncio.Lock()
+        self._last_request_time: float = 0.0
+        self._rate_limit_lock = asyncio.Lock()
+        self._min_request_interval = 1.0  # 1 request per second max globally
         
+    async def _wait_for_rate_limit(self) -> None:
+        """
+        Enforce a global minimum interval between requests to prevent hitting 429 limits.
+        """
+        async with self._rate_limit_lock:
+            now = time.time()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_request_interval:
+                await asyncio.sleep(self._min_request_interval - elapsed)
+            self._last_request_time = time.time()
+
     async def _ensure_authenticated(self) -> None:
         """
         Checks if the token is missing or expired, and re-authenticates if necessary.
@@ -65,51 +81,94 @@ class LumuSession:
         async with self._auth_lock:
             await self.authenticate_locked()
 
+    async def _request_with_retry(
+        self, 
+        method: str, 
+        url: str, 
+        headers: Optional[Dict[str, str]] = None, 
+        params: Optional[Dict[str, Any]] = None, 
+        json_data: Optional[Dict[str, Any]] = None,
+        auth_required: bool = True
+    ) -> httpx.Response:
+        """
+        Generic request wrapper with exponential backoff and authentication handling.
+        """
+        if auth_required:
+            await self._ensure_authenticated()
+            if not headers:
+                headers = {}
+            headers["Authorization"] = self.bearer_token
+            headers["Accept"] = "application/json"
+
+        max_retries = self.settings.lumu_max_retries
+        initial_backoff = self.settings.lumu_initial_backoff
+
+        for attempt in range(max_retries + 1):
+            try:
+                # Apply global rate limit throttle before executing any request
+                await self._wait_for_rate_limit()
+
+                response = await self.client.request(
+                    method=method, 
+                    url=url, 
+                    headers=headers, 
+                    params=params, 
+                    json=json_data
+                )
+
+                if response.status_code == 429:
+                    if attempt == max_retries:
+                        logger.error(f"Max retries reached for 429 error at {url}")
+                        response.raise_for_status()
+                    
+                    backoff = initial_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(f"Rate limited (429) for {url}. Retrying in {backoff:.2f}s (Attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if response.status_code >= 500:
+                    if attempt == max_retries:
+                        logger.error(f"Max retries reached for server error ({response.status_code}) at {url}")
+                        response.raise_for_status()
+                    
+                    backoff = initial_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(f"Server error ({response.status_code}) for {url}. Retrying in {backoff:.2f}s (Attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if response.status_code == 401 and auth_required:
+                    logger.warning(f"Received 401 Unauthorized for {url}. Refreshing token and retrying...")
+                    await self.authenticate()
+                    headers["Authorization"] = self.bearer_token
+                    # Direct recursion for 401 retry to avoid complex loop logic
+                    return await self._request_with_retry(method, url, headers, params, json_data, auth_required)
+
+                response.raise_for_status()
+                return response
+            
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                if attempt == max_retries:
+                    logger.error(f"Request failed after {max_retries} retries: {e}")
+                    raise
+                
+                backoff = initial_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(f"Request error for {url}: {e}. Retrying in {backoff:.2f}s...")
+                await asyncio.sleep(backoff)
+
+        raise RuntimeError("Request failed after retries")
+
     async def get_with_auth(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """
-        Wrapper for GET requests that automatically handles authentication and token refreshing.
+        Wrapper for GET requests that automatically handles authentication and retries.
         """
-        await self._ensure_authenticated()
-        
-        headers = {
-            "Authorization": self.bearer_token,
-            "Accept": "application/json"
-        }
-        
-        response = await self.client.get(endpoint, headers=headers, params=params)
-        
-        # Handle auto-reauthentication layer (401 Unauthorized)
-        if response.status_code == 401:
-            logger.warning("Received 401 Unauthorized. Token might be invalid or revoked. Re-authenticating...")
-            await self.authenticate()
-            # Retry the exact same request once with the new token
-            headers["Authorization"] = self.bearer_token
-            response = await self.client.get(endpoint, headers=headers, params=params)
-            
-        response.raise_for_status()
+        response = await self._request_with_retry("GET", endpoint, params=params)
         return response.json()
 
     async def post_with_auth(self, endpoint: str, json_data: Dict[str, Any]) -> Any:
         """
-        Wrapper for POST requests that automatically handles authentication.
+        Wrapper for POST requests that automatically handles authentication and retries.
         """
-        await self._ensure_authenticated()
-        
-        headers = {
-            "Authorization": self.bearer_token,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        
-        response = await self.client.post(endpoint, headers=headers, json=json_data)
-        
-        if response.status_code == 401:
-            logger.warning("Received 401 Unauthorized on POST. Re-authenticating...")
-            await self.authenticate()
-            headers["Authorization"] = self.bearer_token
-            response = await self.client.post(endpoint, headers=headers, json=json_data)
-            
-        response.raise_for_status()
+        response = await self._request_with_retry("POST", endpoint, json_data=json_data)
         return response.json()
 
     async def get_tenants(self, items: int = 500, page: int = 1) -> list:
@@ -175,10 +234,28 @@ class LumuSession:
         # Start window from now (or a specific future date if needed)
         end_date = datetime.now(timezone.utc)
         
+        parsed_from_date = None
+        if from_date:
+            try:
+                # Handle standard ISO formats, e.g. "2026-04-10T16:07:14Z"
+                if from_date.endswith('Z'):
+                    parsed_from_date = datetime.fromisoformat(from_date[:-1] + '+00:00')
+                else:
+                    parsed_from_date = datetime.fromisoformat(from_date)
+            except ValueError:
+                logger.warning(f"Failed to parse from_date '{from_date}', fetching 2 years of history instead.")
+
         # We will iterate backwards in 30-day chunks.
         # A maximum of 24 chunks (2 years) is a safe upper bound to prevent infinite loops.
         for _ in range(24):
             start_date = end_date - timedelta(days=30)
+            
+            # Clamp the window if from_date is provided
+            if parsed_from_date:
+                if end_date <= parsed_from_date:
+                    break  # We have already pulled up to the from_date boundary
+                if start_date < parsed_from_date:
+                    start_date = parsed_from_date
             
             from_str = start_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             to_str = end_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -199,14 +276,20 @@ class LumuSession:
                 }
                 
                 logger.info(f"Fetching incidents window {from_str[:10]} to {to_str[:10]} (Page {page})...")
-                response = await self.client.post(url, params=params, json=payload)
+                # Using _request_with_retry for the Defender API (no token auth, key in params)
+                response = await self._request_with_retry(
+                    "POST", 
+                    url, 
+                    params=params, 
+                    json_data=payload,
+                    auth_required=False
+                )
                 
                 # If we hit the retention limit, the API returns a 400 error. Break gracefully.
                 if response.status_code == 400:
                     logger.info("Reached the maximum historical retention limit of the API.")
                     return all_items
                 
-                response.raise_for_status()
                 data = response.json()
                 
                 items = []
@@ -229,11 +312,15 @@ class LumuSession:
                     if len(items) < page_size:
                         break
                     page += 1
+                    # Avoid hammering the API in pagination sweeps
+                    await asyncio.sleep(0.7)
                 else:
                     break
             
             # Shift the window backwards for the next chunk
             end_date = start_date
+            # Avoid hammering the API in historical sweeps
+            await asyncio.sleep(0.5)
                 
         return all_items
 
@@ -243,8 +330,7 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/details"
         params = {"key": company_key}
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
+        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
         return response.json()
 
     async def get_incident_contacts(self, company_key: str, incident_uuid: str) -> List[Dict[str, Any]]:
@@ -253,8 +339,7 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/contacts"
         params = {"key": company_key}
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
+        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
         data = response.json()
         if isinstance(data, list):
             return data

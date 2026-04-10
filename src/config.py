@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     polling_interval_minutes: int = Field(5, description="Frequency of Lumu polling in minutes")
     verify_ssl: bool = Field(True, description="Enable or disable SSL verification for all API clients")
 
+    # Resilience
+    lumu_max_retries: int = Field(5, description="Maximum number of retries for Lumu API requests (429/5xx)")
+    lumu_initial_backoff: float = Field(1.0, description="Initial backoff delay in seconds for exponential retry")
+
     # Persistence
     alert_state_file: str = Field("data/sent_incidents.json", description="Path to the local JSON file for tracking notified incidents")
 

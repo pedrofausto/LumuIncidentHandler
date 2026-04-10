@@ -13,6 +13,8 @@ __pycache__/
 debug_*.py
 _*.py
 _*.json
+cmp.json
+lumu_details.json
 data/
 /*.html
 **/*.log
@@ -20,6 +22,7 @@ src/*_new_method.py
 
 # Testing and Proofs
 test_*.py
+test.py
 poc_*.py
 
 # Ignore all .md files by default
@@ -28,11 +31,15 @@ poc_*.py
 # Exceptions to keep
 !/README.md
 !**/docs/**/*.md
-test.py
-scratch/force_ingestion.py
+# scratch/ is ignored by default below
 
 # Unneeded execution and diagnostic files
 tmp_opensearch_dashboards.yml
 lumu_logs.txt
 indexer_logs.txt
 config/
+
+# Scratch and Temp directories
+scratch/
+tmp/
+.agent/

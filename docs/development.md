@@ -80,12 +80,28 @@ docker-compose logs -f
 ```
 
 ### State Management
-The system tracks the most recent incident activity in `data/sent_incidents.json` using a **last_pulled_time** timestamp. 
+The system tracks incident activity in `data/sent_incidents.json` using a **per-incident timestamp map**.
 
-- To re-process incidents from the last 30 days, clear the state file:
-  ```bash
-  echo "{}" > data/sent_incidents.json
-  ```
+The state file schema:
+```json
+{
+  "last_pulled_time": "2026-04-10T16:07:14Z",
+  "incidents": {
+    "365f7220-34f6-11f1-bbc7-8fba9bac8610": "2026-04-10T16:07:14Z"
+  }
+}
+```
+
+An incident is re-enriched and re-upserted to Wazuh if:
+- Its UUID is **not in the `incidents` map** (new incident), or
+- Its `lastContact` is **newer than the stored timestamp** for that UUID (updated incident).
+
+This ensures that incident updates — new endpoints, additional firewall responses, status changes — are always reflected in the Wazuh Indexer.
+
+To re-process all incidents from the last 30 days, clear the state file:
+```bash
+echo "{}" > data/sent_incidents.json
+```
 
 ### Connectivity Checks
 If incidents are not appearing in your dashboard:

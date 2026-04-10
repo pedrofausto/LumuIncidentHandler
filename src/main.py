@@ -26,9 +26,14 @@ async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: st
         summary_task = client.get_incident_context_summary(tenant_uuid, inc_uuid)
         articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
         
-        stix, details, summary, articles = await asyncio.gather(
-            stix_task, details_task, summary_task, articles_task, return_exceptions=True
-        )
+        # Sequential execution with small delays to respect rate limits
+        stix = await stix_task
+        await asyncio.sleep(0.5)
+        details = await details_task
+        await asyncio.sleep(0.5)
+        summary = await summary_task
+        await asyncio.sleep(0.5)
+        articles = await articles_task
         
         # Gracefully handle exceptions when specific APIs return 404 or fail
         return {
@@ -53,24 +58,54 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
             return
 
         # 1. Fetch active incidents from Defender API
-        raw_incidents = await client.get_all_incidents(company_key)
+        # Pass a bounded from_date so we don't query 2 years of history.
+        # We subtract 7 days from the high-water mark to safely catch updates to older incidents.
+        from datetime import timedelta
+        from_date_pad = None
+        
+        if analyzer.last_pulled_time:
+            try:
+                if analyzer.last_pulled_time.endswith('Z'):
+                    dt = datetime.fromisoformat(analyzer.last_pulled_time[:-1] + '+00:00')
+                else:
+                    dt = datetime.fromisoformat(analyzer.last_pulled_time)
+                dt_padded = dt - timedelta(days=7)
+                from_date_pad = dt_padded.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            except Exception as e:
+                logger.warning(f"Could not calculate sliding window from '{analyzer.last_pulled_time}': {e}. Enforcing 7-day boundary.")
+                # We enforce the cold start boundary rather than passing a bad string
+        
+        if not from_date_pad:
+            # Cold start logic: If no valid state exists, default to fetching the last 7 days only
+            # to avoid fetching the entire 2-year history and hitting rate limits.
+            dt_padded = datetime.now(timezone.utc) - timedelta(days=7)
+            from_date_pad = dt_padded.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            logger.info(f"Applying bounded fetch to {from_date_pad}")
+
+        raw_incidents = await client.get_all_incidents(company_key, from_date=from_date_pad)
 
         if not raw_incidents:
             logger.info(f"No active incidents found for tenant '{tenant_name}'.")
             return
 
-        # 2. Deduplication: only process incidents that are new or updated
+        # 2. Deduplication: re-process incidents that are new OR have been updated since last ingest
         new_raw_incidents = []
         for inc in raw_incidents:
             uuid = inc.get('uuid') or inc.get('id')
             if not uuid: continue
-            
-            # Use Lumu's last activity time to track updates
+
             last_activity = inc.get('lastContact') or inc.get('statusTimestamp') or inc.get('timestamp') or ''
-            
-            # Process if Lumu's timestamp for the event is strictly newer than our global high-water mark
-            if not analyzer.last_pulled_time or last_activity > analyzer.last_pulled_time:
-                new_raw_incidents.append(inc)
+
+            # Gate 1: outer polling window — skip if older than the global HWM
+            if analyzer.last_pulled_time and last_activity < analyzer.last_pulled_time:
+                continue
+
+            # Gate 2: per-incident — only re-process if this specific incident has new activity
+            stored_ts = analyzer._incident_times.get(uuid, '')
+            if stored_ts and last_activity <= stored_ts:
+                continue
+
+            new_raw_incidents.append(inc)
 
         if not new_raw_incidents:
             logger.info(f"All {len(raw_incidents)} active incident(s) for '{tenant_name}' have already been alerted.")
@@ -78,8 +113,17 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
 
         logger.info(f"Found {len(new_raw_incidents)} new incident(s). Fetching intelligence concurrently...")
 
-        # 3. Concurrent Enrichment
-        tasks = [enrich_incident(client, tenant_uuid, company_key, inc.get('uuid') or inc.get('id')) for inc in new_raw_incidents]
+        # 3. Concurrent Enrichment with Semaphore to limit rate
+        semaphore = asyncio.Semaphore(3)
+        
+        async def sem_enrich(inc_uuid):
+            async with semaphore:
+                result = await enrich_incident(client, tenant_uuid, company_key, inc_uuid)
+                # Small pause after each incident to stay under limits
+                await asyncio.sleep(1.0)
+                return result
+
+        tasks = [sem_enrich(inc.get('uuid') or inc.get('id')) for inc in new_raw_incidents]
         enrichment_results = await asyncio.gather(*tasks)
 
         stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
@@ -95,7 +139,7 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
             summary_map=summary_map,
             articles_map=articles_map
         )
-        new_events = analyzer.filter_new_incidents(all_incident_events)
+        new_events = analyzer.filter_changed_incidents(all_incident_events)
 
         if new_events:
             logger.warning(f"Alerting on {len(new_events)} new incident(s) for '{tenant_name}'.")

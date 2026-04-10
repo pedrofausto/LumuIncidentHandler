@@ -102,7 +102,27 @@ class Analyzer:
     def __init__(self):
         self._state_file = get_settings().alert_state_file
         state_data = self._load_state()
-        self.last_pulled_time: str = state_data.get('last_pulled_time', '')
+        
+        # Schema Migration: If state_data lacks 'incidents' but has items, it's the old schema
+        if state_data and "incidents" not in state_data and "last_pulled_time" not in state_data:
+            logger.info("Migrating legacy state schema to new per-incident schema...")
+            self._incident_times = {str(k): str(v) for k, v in state_data.items()}
+            # Synthesize last_pulled_time from the newest incident
+            if self._incident_times:
+                max_val = max(self._incident_times.values())
+                # Handle old float timestamps vs new isoformat strings
+                try:
+                    # check if it's a float
+                    float_ts = float(max_val)
+                    from datetime import datetime, timezone
+                    self.last_pulled_time = datetime.fromtimestamp(float_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                except ValueError:
+                    self.last_pulled_time = max_val
+            else:
+                self.last_pulled_time = ""
+        else:
+            self.last_pulled_time: str = state_data.get('last_pulled_time', '')
+            self._incident_times: Dict[str, str] = state_data.get('incidents', {})
 
     def _load_state(self) -> Dict[str, Any]:
         """Loads the alerted incidents from the JSON state file."""
@@ -147,10 +167,13 @@ class Analyzer:
             # Secure file permissions (0o600)
             fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as f:
-                json.dump({"last_pulled_time": self.last_pulled_time}, f, indent=2)
+                json.dump({
+                    "last_pulled_time": self.last_pulled_time,
+                    "incidents": self._incident_times
+                }, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-                
+
             os.replace(temp_file, abs_path)
         except (IOError, OSError) as e:
             logger.error(f"Failed to save state file {self._state_file}: {e}")
@@ -463,19 +486,38 @@ class Analyzer:
 
         return incident_events
 
-    def filter_new_incidents(self, events: List[IncidentEvent]) -> List[IncidentEvent]:
-        new_events = []
-        updated = False
+    def filter_changed_incidents(self, events: List[IncidentEvent]) -> List[IncidentEvent]:
+        """
+        Returns incidents that are either:
+        - New (UUID never seen before), or
+        - Updated (event.last_contact is strictly newer than the stored per-incident timestamp).
+
+        Updates the per-incident map and global high-water mark for every event that passes.
+        """
+        changed_events = []
+        state_updated = False
         new_max_time = self.last_pulled_time
-        
+
         for e in events:
-            new_events.append(e)
+            stored_ts = self._incident_times.get(e.incident_uuid, '')
+
+            is_new = not stored_ts
+            is_updated = bool(e.last_contact and e.last_contact > stored_ts)
+
+            if is_new or is_updated:
+                changed_events.append(e)
+                # Update stored timestamp for this specific incident
+                if e.last_contact:
+                    self._incident_times[e.incident_uuid] = e.last_contact
+                    state_updated = True
+
+            # Advance global high-water mark regardless (controls outer polling window)
             if e.last_contact and e.last_contact > new_max_time:
                 new_max_time = e.last_contact
-                updated = True
-        
-        if updated:
+                state_updated = True
+
+        if state_updated:
             self.last_pulled_time = new_max_time
             self._save_state()
-            
-        return new_events
+
+        return changed_events
