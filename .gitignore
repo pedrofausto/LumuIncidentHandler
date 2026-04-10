@@ -30,3 +30,8 @@ poc_*.py
 !**/docs/**/*.md
 test.py
 scratch/force_ingestion.py
+
+# Unneeded execution and diagnostic files
+tmp_opensearch_dashboards.yml
+lumu_logs.txt
+indexer_logs.txt
