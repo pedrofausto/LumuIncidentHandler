@@ -35,3 +35,4 @@ scratch/force_ingestion.py
 tmp_opensearch_dashboards.yml
 lumu_logs.txt
 indexer_logs.txt
+config/
