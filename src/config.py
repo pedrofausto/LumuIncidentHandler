@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     # Orchestration
     polling_interval_minutes: int = Field(5, description="Frequency of Lumu polling in minutes")
+    verify_ssl: bool = Field(True, description="Enable or disable SSL verification for all API clients")
 
     # Persistence
     alert_state_file: str = Field("data/sent_incidents.json", description="Path to the local JSON file for tracking notified incidents")

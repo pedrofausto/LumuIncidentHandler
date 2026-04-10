@@ -11,7 +11,7 @@ class LumuSession:
     def __init__(self):
         self.settings = get_settings()
         self.base_url = self.settings.lumu_api_base_url.rstrip("/")
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=False)
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=self.settings.verify_ssl)
         self.bearer_token: Optional[str] = None
         self.token_expiry: float = 0
         self._auth_lock = asyncio.Lock()

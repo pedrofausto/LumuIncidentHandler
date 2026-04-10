@@ -10,7 +10,7 @@ class WazuhClient:
         self.settings = get_settings()
         self.api_url = f"{self.settings.indexer_url.rstrip('/')}/lumu-incidents-1.x/_doc"
         self.auth = (self.settings.indexer_username, self.settings.indexer_password.get_secret_value())
-        self.client = httpx.AsyncClient(timeout=30.0, verify=False)
+        self.client = httpx.AsyncClient(timeout=30.0, verify=self.settings.verify_ssl)
 
     async def send_incident(self, json_data: Dict[str, Any]) -> None:
         """
