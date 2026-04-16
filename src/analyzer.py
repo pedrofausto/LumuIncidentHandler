@@ -122,7 +122,44 @@ class Analyzer:
                 self.last_pulled_time = ""
         else:
             self.last_pulled_time: str = state_data.get('last_pulled_time', '')
+            if not self.last_pulled_time:
+                self.last_pulled_time = get_settings().lumu_initial_time
             self._incident_times: Dict[str, str] = state_data.get('incidents', {})
+            
+            persisted_offset = state_data.get('offset', 0)
+            env_offset = get_settings().lumu_initial_offset
+            force_offset = get_settings().lumu_force_offset
+            
+            if force_offset:
+                logger.info(f"LUMU_FORCE_OFFSET is enabled. Overriding persisted offset ({persisted_offset}) with LUMU_INITIAL_OFFSET ({env_offset}).")
+                self.offset = env_offset
+                self._incident_times = {} # Wipe tracked state times to allow a clean sync from new offset
+                self._save_state()
+            else:
+                self.offset = persisted_offset
+
+    def should_process_incident(self, raw_incident: Dict[str, Any]) -> bool:
+        """
+        Determines if an incident has changed since the last time it was seen.
+        Checks for new UUIDs or updated lastContact timestamps.
+        """
+        uuid = raw_incident.get('id') or raw_incident.get('uuid')
+        if not uuid:
+            return False
+            
+        last_contact = raw_incident.get('lastContact') or raw_incident.get('timestamp') or ''
+        stored_ts = self._incident_times.get(uuid, '')
+        
+        return not stored_ts or (last_contact > stored_ts)
+
+    def update_incident_time(self, uuid: str, timestamp: str):
+        """Manually update the last seen time for a specific incident."""
+        if uuid and timestamp:
+            self._incident_times[uuid] = timestamp
+            if not self.last_pulled_time or timestamp > self.last_pulled_time:
+                self.last_pulled_time = timestamp
+            self._save_state()
+
 
     def _load_state(self) -> Dict[str, Any]:
         """Loads the alerted incidents from the JSON state file."""
@@ -169,6 +206,7 @@ class Analyzer:
             with os.fdopen(fd, 'w') as f:
                 json.dump({
                     "last_pulled_time": self.last_pulled_time,
+                    "offset": self.offset,
                     "incidents": self._incident_times
                 }, f, indent=2)
                 f.flush()
@@ -485,6 +523,34 @@ class Analyzer:
             incident_events.append(event)
 
         return incident_events
+
+    def extract_incidents_from_updates(self, updates_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Processes a list of updates from the /api/incidents/open-incidents/updates endpoint.
+        Unwraps incident data from: NewIncidentCreated, IncidentClosed, IncidentUnmuted, etc.
+        Returns a list of raw incident objects suitable for evaluate_incidents.
+        """
+        incidents = []
+        for update in updates_data:
+            # The structure is: { "EventType": { "incident": { ... }, "companyId": "..." } }
+            # Or: { "OpenIncidentsStatusUpdated": { ... } } (ignored for now)
+            
+            event_type = next(iter(update.keys()))
+            event_data = update[event_type]
+            
+            if event_type in ["NewIncidentCreated", "IncidentClosed", "IncidentUnmuted", "IncidentMuted", "IncidentReopened"]:
+                incident_data = event_data.get("incident")
+                if incident_data:
+                    # Enrich with event type context if needed for downstream (e.g. status)
+                    incidents.append(incident_data)
+                else:
+                    logger.warning(f"Update event {event_type} missing incident data.")
+            elif event_type == "OpenIncidentsStatusUpdated":
+                logger.debug(f"Received status update: {event_data}")
+            else:
+                logger.debug(f"Ignoring update event type: {event_type}")
+                
+        return incidents
 
     def filter_changed_incidents(self, events: List[IncidentEvent]) -> List[IncidentEvent]:
         """

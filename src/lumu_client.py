@@ -13,13 +13,15 @@ class LumuSession:
     def __init__(self):
         self.settings = get_settings()
         self.base_url = self.settings.lumu_api_base_url.rstrip("/")
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=self.settings.verify_ssl)
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=self.settings.verify_ssl, limits=limits)
         self.bearer_token: Optional[str] = None
         self.token_expiry: float = 0
         self._auth_lock = asyncio.Lock()
         self._last_request_time: float = 0.0
         self._rate_limit_lock = asyncio.Lock()
-        self._min_request_interval = 1.0  # 1 request per second max globally
+        self.rate_limit_hits = 0
+        self._min_request_interval = 2.0  # 2 seconds max globally
         
     async def _wait_for_rate_limit(self) -> None:
         """
@@ -117,6 +119,7 @@ class LumuSession:
                 )
 
                 if response.status_code == 429:
+                    self.rate_limit_hits += 1
                     if attempt == max_retries:
                         logger.error(f"Max retries reached for 429 error at {url}")
                         response.raise_for_status()
@@ -217,6 +220,24 @@ class LumuSession:
         """
         endpoint = f"/data-api/collectors/companies/{company_uuid}/appliances/{appliance_uuid}/status"
         return await self.get_with_auth(endpoint)
+
+    async def get_incident_updates(self, company_key: str, offset: int = 0, items: int = 50, delay_time: int = 5) -> Dict[str, Any]:
+        """
+        Fetch incremental incident updates using an offset. 
+        Uses the Lumu Defender API.
+        """
+        url = f"{self.settings.lumu_defender_url.rstrip('/')}/api/incidents/open-incidents/updates"
+        params = {
+            "key": company_key,
+            "offset": offset,
+            "items": items,
+            "time": delay_time
+        }
+        
+        logger.info(f"Fetching incident updates from offset {offset}...")
+        # Note: auth_required=False because this API uses the 'key' query param
+        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
+        return response.json()
 
     async def get_all_incidents(self, company_key: str, from_date: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -323,6 +344,75 @@ class LumuSession:
             await asyncio.sleep(0.5)
                 
         return all_items
+
+    async def get_open_incidents(self, company_key: str, from_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch all currently OPEN incidents, optionally bounded by a starting time.
+        Used for state-based synchronization to ensure no incident is missed by the journal.
+        """
+        from datetime import datetime, timezone
+        url = f"{self.settings.lumu_defender_url}/api/incidents/all"
+        params = {"key": company_key}
+        
+        all_open = []
+        seen_ids = set()
+        page = 1
+        page_size = 50
+        
+        while True:
+            payload = {
+                "status": ["open"],
+                "pagination": {
+                    "page": page,
+                    "items": page_size
+                }
+            }
+            if from_date:
+                payload["fromDate"] = from_date
+                payload["toDate"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            
+            logger.info(f"Fetching open incidents state (Page {page})...")
+            response = await self._request_with_retry(
+                "POST", 
+                url, 
+                params=params, 
+                json_data=payload,
+                auth_required=False
+            )
+            
+            if response.status_code != 200:
+                break
+                
+            data = response.json()
+            items = data.get("items", []) if isinstance(data, dict) else []
+            
+            if not items:
+                break
+                
+            new_items_this_page = 0
+            for item in items:
+                item_id = item.get("id") or item.get("uuid")
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    all_open.append(item)
+                    new_items_this_page += 1
+            
+            # If the API returned items, but NONE of them were new to our set, we are stuck in a loop.
+            if new_items_this_page == 0:
+                logger.warning("API returned duplicate items on a new page. Breaking pagination loop.")
+                break
+
+            if len(items) < page_size:
+                break
+                
+            if page >= 200:
+                logger.warning("Reached maximum page limit (200) for state sync. Forcing break.")
+                break
+                
+            page += 1
+            await asyncio.sleep(0.5)
+            
+        return all_open
 
     async def get_incident_details(self, company_key: str, incident_uuid: str) -> Dict[str, Any]:
         """

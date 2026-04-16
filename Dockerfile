@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 # Prevent Python from writing pyc files and keep stdout unbuffered
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -16,13 +16,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lumu_monitor")
 
-async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str) -> Dict[str, Any]:
+async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False) -> Dict[str, Any]:
     """
     Fetches STIX, details, summary context, and external-articles context for a single incident concurrently.
     """
     try:
-        stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
         details_task = client.get_incident_details(company_key, inc_uuid)
+        
+        if is_bootstrap_mode:
+            # Skip deep enrichment to save API calls during synchronization backlog
+            details = await details_task
+            return {
+                'uuid': inc_uuid, 
+                'stix': {}, 
+                'details': details if not isinstance(details, Exception) else {},
+                'summary': {},
+                'articles': []
+            }
+
+        stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
         summary_task = client.get_incident_context_summary(tenant_uuid, inc_uuid)
         articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
         
@@ -49,7 +61,9 @@ async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: st
 
 async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhClient, tenant_uuid: str, tenant_name: str, company_key: str):
     """
-    Monitors a single tenant for security incidents and fetches STIX intelligence.
+    Monitors a single tenant for security incidents using a Hybrid Strategy:
+    1. State Sync: Fetch all currently OPEN incidents.
+    2. Incremental Sync: Fetch journal UPDATES via offset.
     """
     logger.info(f"Scanning security incidents for tenant '{tenant_name}' ({tenant_uuid})...")
     try:
@@ -57,111 +71,137 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, wazuh: WazuhCl
             logger.warning(f"LUMU_DEFENDER_KEY is not set. Skipping incident scan.")
             return
 
-        # 1. Fetch active incidents from Defender API
-        # Pass a bounded from_date so we don't query 2 years of history.
-        # We subtract 7 days from the high-water mark to safely catch updates to older incidents.
-        from datetime import timedelta
-        from_date_pad = None
+        # --- 1. State Sync: Fetch and process recently OPEN incidents ---
+        logger.info(f"Initializing State Sync for open incidents (since {analyzer.last_pulled_time})...")
+        open_incidents = await client.get_open_incidents(company_key, from_date=analyzer.last_pulled_time)
         
-        if analyzer.last_pulled_time:
-            try:
-                if analyzer.last_pulled_time.endswith('Z'):
-                    dt = datetime.fromisoformat(analyzer.last_pulled_time[:-1] + '+00:00')
-                else:
-                    dt = datetime.fromisoformat(analyzer.last_pulled_time)
-                dt_padded = dt - timedelta(days=7)
-                from_date_pad = dt_padded.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            except Exception as e:
-                logger.warning(f"Could not calculate sliding window from '{analyzer.last_pulled_time}': {e}. Enforcing 7-day boundary.")
-                # We enforce the cold start boundary rather than passing a bad string
+        # Filter to only enriched those that actually changed
+        to_enrich_state = [inc for inc in open_incidents if analyzer.should_process_incident(inc)]
         
-        if not from_date_pad:
-            # Cold start logic: If no valid state exists, default to fetching the last 7 days only
-            # to avoid fetching the entire 2-year history and hitting rate limits.
-            dt_padded = datetime.now(timezone.utc) - timedelta(days=7)
-            from_date_pad = dt_padded.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            logger.info(f"Applying bounded fetch to {from_date_pad}")
-
-        raw_incidents = await client.get_all_incidents(company_key, from_date=from_date_pad)
-
-        if not raw_incidents:
-            logger.info(f"No active incidents found for tenant '{tenant_name}'.")
-            return
-
-        # 2. Deduplication: re-process incidents that are new OR have been updated since last ingest
-        new_raw_incidents = []
-        for inc in raw_incidents:
-            uuid = inc.get('uuid') or inc.get('id')
-            if not uuid: continue
-
-            last_activity = inc.get('lastContact') or inc.get('statusTimestamp') or inc.get('timestamp') or ''
-
-            # Gate 1: outer polling window — skip if older than the global HWM
-            if analyzer.last_pulled_time and last_activity < analyzer.last_pulled_time:
-                continue
-
-            # Gate 2: per-incident — only re-process if this specific incident has new activity
-            stored_ts = analyzer._incident_times.get(uuid, '')
-            if stored_ts and last_activity <= stored_ts:
-                continue
-
-            new_raw_incidents.append(inc)
-
-        if not new_raw_incidents:
-            logger.info(f"All {len(raw_incidents)} active incident(s) for '{tenant_name}' have already been alerted.")
-            return
-
-        logger.info(f"Found {len(new_raw_incidents)} new incident(s). Fetching intelligence concurrently...")
-
-        # 3. Concurrent Enrichment with Semaphore to limit rate
-        semaphore = asyncio.Semaphore(3)
-        
-        async def sem_enrich(inc_uuid):
-            async with semaphore:
-                result = await enrich_incident(client, tenant_uuid, company_key, inc_uuid)
-                # Small pause after each incident to stay under limits
-                await asyncio.sleep(1.0)
-                return result
-
-        tasks = [sem_enrich(inc.get('uuid') or inc.get('id')) for inc in new_raw_incidents]
-        enrichment_results = await asyncio.gather(*tasks)
-
-        stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
-        details_map = {res['uuid']: res['details'] for res in enrichment_results}
-        summary_map = {res['uuid']: res['summary'] for res in enrichment_results}
-        articles_map = {res['uuid']: res['articles'] for res in enrichment_results}
-
-        # 4. Evaluate and filter
-        all_incident_events = analyzer.evaluate_incidents(
-            new_raw_incidents, 
-            stix_data_map=stix_data_map, 
-            details_map=details_map,
-            summary_map=summary_map,
-            articles_map=articles_map
-        )
-        new_events = analyzer.filter_changed_incidents(all_incident_events)
-
-        if new_events:
-            logger.warning(f"Alerting on {len(new_events)} new incident(s) for '{tenant_name}'.")
-            
-            # 5. Dispatch to Wazuh
-            for event in new_events:
-                try:
-                    event_dict = dataclasses.asdict(event)
-                    # OpenSearch TSDB heavily relies on @timestamp reflecting ingestion time natively
-                    event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
-                    # Inject generic tenant context
-                    event_dict["customer_name"] = tenant_name
-                    event_dict["customer_uuid"] = tenant_uuid
-                    await wazuh.send_incident(event_dict)
-                except Exception as e:
-                    logger.error(f"Failed to send incident {event.incident_uuid} to Wazuh: {e}")
+        if to_enrich_state:
+            logger.info(f"Detected {len(to_enrich_state)} new or updated open incident(s) in state sync.")
+            # Reuse the enrichment and sending logic
+            await process_and_send_batch(
+                client, analyzer, wazuh, 
+                raw_incidents=to_enrich_state, 
+                tenant_uuid=tenant_uuid, 
+                tenant_name=tenant_name, 
+                company_key=company_key,
+                is_bootstrap_mode=False # State sync is usually light enough
+            )
         else:
-            logger.info(f"No new incidents to alert for '{tenant_name}' after filtering.")
+            logger.info("Universal state sync: All open incidents are already up-to-date.")
+
+        # --- 2. Incremental Sync: Process Update Journal via Offset ---
+        items_per_page = 50
+        while True:
+            pre_batch_hits = client.rate_limit_hits
+            updates_data = await client.get_incident_updates(company_key, offset=analyzer.offset, items=items_per_page)
+            updates_list = updates_data.get("updates", [])
+            new_offset = updates_data.get("offset")
+            
+            if not updates_list:
+                logger.info(f"No new incident journal updates for tenant '{tenant_name}'.")
+                if new_offset is not None:
+                    analyzer.offset = new_offset
+                    analyzer._save_state()
+                break
+
+            logger.info(f"Retrieved {len(updates_list)} journal update event(s). Processing...")
+            
+            # Detect Bootstrap / Backlog mode
+            is_bootstrap_mode = len(updates_list) >= items_per_page
+            if is_bootstrap_mode:
+                logger.debug(f"High backlog detected (>= {items_per_page} updates). Deep enrichments will be skipped.")
+
+            raw_incidents = analyzer.extract_incidents_from_updates(updates_list)
+
+            if raw_incidents:
+                await process_and_send_batch(
+                    client, analyzer, wazuh, 
+                    raw_incidents, 
+                    tenant_uuid, 
+                    tenant_name, 
+                    company_key, 
+                    is_bootstrap_mode=is_bootstrap_mode
+                )
+            else:
+                logger.info("No incident-related updates in this journal batch.")
+
+            # Advance Offset and Persist State
+            analyzer.offset = new_offset
+            analyzer._save_state()
+            
+            # 5. Evaluate AIMD for next batch
+            post_batch_hits = client.rate_limit_hits
+            if post_batch_hits > pre_batch_hits:
+                items_per_page = max(5, int(items_per_page / 2))
+                logger.warning(f"Rate-limit pressure detected. Shrinking batch size to {items_per_page}.")
+            else:
+                items_per_page = min(50, items_per_page + 5)
+            
+            if len(updates_list) < items_per_page:
+                break
 
     except Exception as e:
         logger.error(f"Error processing incidents for tenant {tenant_uuid}: {str(e)}")
 
+async def process_and_send_batch(
+    client: LumuSession, 
+    analyzer: Analyzer, 
+    wazuh: WazuhClient, 
+    raw_incidents: List[Dict[str, Any]], 
+    tenant_uuid: str, 
+    tenant_name: str, 
+    company_key: str,
+    is_bootstrap_mode: bool = False
+):
+    """
+    Helper to enrich a batch of raw incidents, deduplicate, and send to Wazuh.
+    """
+    # 1. Enrichment with Semaphore
+    semaphore = asyncio.Semaphore(2)
+    
+    async def sem_enrich(inc_uuid):
+        async with semaphore:
+            result = await enrich_incident(client, tenant_uuid, company_key, inc_uuid, is_bootstrap_mode)
+            await asyncio.sleep(1.0)
+            return result
+
+    # Deduplicate UUIDs in the current batch
+    unique_uuids = list(set(inc.get('uuid') or inc.get('id') for inc in raw_incidents if (inc.get('uuid') or inc.get('id'))))
+    tasks = [sem_enrich(uuid) for uuid in unique_uuids]
+    
+    enrichment_results = await asyncio.gather(*tasks)
+
+    stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
+    details_map = {res['uuid']: res['details'] for res in enrichment_results}
+    summary_map = {res['uuid']: res['summary'] for res in enrichment_results}
+    articles_map = {res['uuid']: res['articles'] for res in enrichment_results}
+
+    # 3. Evaluate and send to Wazuh
+    all_incident_events = analyzer.evaluate_incidents(
+        raw_incidents, 
+        stix_data_map=stix_data_map, 
+        details_map=details_map,
+        summary_map=summary_map,
+        articles_map=articles_map
+    )
+    
+    if all_incident_events:
+        logger.info(f"Sending {len(all_incident_events)} incident events to Wazuh for '{tenant_name}'.")
+        for event in all_incident_events:
+            try:
+                event_dict = dataclasses.asdict(event)
+                event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
+                event_dict["customer_name"] = tenant_name
+                event_dict["customer_uuid"] = tenant_uuid
+                await wazuh.send_incident(event_dict)
+                
+                # Update individual incident tracking
+                analyzer.update_incident_time(event.incident_uuid, event.last_contact)
+            except Exception as e:
+                logger.error(f"Failed to send incident {event.incident_uuid} to Wazuh: {e}")
 
 async def run_loop():
     settings = get_settings()
