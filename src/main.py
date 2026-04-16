@@ -22,30 +22,25 @@ async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: st
     """
     try:
         details_task = client.get_incident_details(company_key, inc_uuid)
-        
-        if is_bootstrap_mode:
-            # Skip deep enrichment to save API calls during synchronization backlog
-            details = await details_task
-            return {
-                'uuid': inc_uuid, 
-                'stix': {}, 
-                'details': details if not isinstance(details, Exception) else {},
-                'summary': {},
-                'articles': []
-            }
-
         stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
         summary_task = client.get_incident_context_summary(tenant_uuid, inc_uuid)
-        articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
         
-        # Sequential execution with small delays to respect rate limits
+        # External Articles are the heaviest/slowest, we only skip THESE in bootstrap mode
+        articles_task = None
+        if not is_bootstrap_mode:
+            articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
+        
+        # Batch fetching with small delays to respect rate limits
         stix = await stix_task
         await asyncio.sleep(0.5)
         details = await details_task
         await asyncio.sleep(0.5)
         summary = await summary_task
-        await asyncio.sleep(0.5)
-        articles = await articles_task
+        
+        articles = []
+        if articles_task:
+            await asyncio.sleep(0.5)
+            articles = await articles_task
         
         # Gracefully handle exceptions when specific APIs return 404 or fail
         return {
@@ -157,9 +152,19 @@ async def process_and_send_batch(
     is_bootstrap_mode: bool = False
 ):
     """
-    Helper to enrich a batch of raw incidents, deduplicate, and send to Wazuh.
+    Enriches raw incidents and streams them to Wazuh as they complete.
     """
-    # 1. Enrichment with Semaphore
+    # 1. Map UUIDs to raw objects for reconstruction after streaming
+    uuid_to_raw = {}
+    for inc in raw_incidents:
+        uid = inc.get('uuid') or inc.get('id')
+        if uid:
+            uuid_to_raw[uid] = inc
+
+    if not uuid_to_raw:
+        return
+
+    # 2. Enrichment with Semaphore
     semaphore = asyncio.Semaphore(2)
     
     async def sem_enrich(inc_uuid):
@@ -168,40 +173,47 @@ async def process_and_send_batch(
             await asyncio.sleep(1.0)
             return result
 
-    # Deduplicate UUIDs in the current batch
-    unique_uuids = list(set(inc.get('uuid') or inc.get('id') for inc in raw_incidents if (inc.get('uuid') or inc.get('id'))))
+    unique_uuids = list(uuid_to_raw.keys())
     tasks = [sem_enrich(uuid) for uuid in unique_uuids]
     
-    enrichment_results = await asyncio.gather(*tasks)
-
-    stix_data_map = {res['uuid']: res['stix'] for res in enrichment_results}
-    details_map = {res['uuid']: res['details'] for res in enrichment_results}
-    summary_map = {res['uuid']: res['summary'] for res in enrichment_results}
-    articles_map = {res['uuid']: res['articles'] for res in enrichment_results}
-
-    # 3. Evaluate and send to Wazuh
-    all_incident_events = analyzer.evaluate_incidents(
-        raw_incidents, 
-        stix_data_map=stix_data_map, 
-        details_map=details_map,
-        summary_map=summary_map,
-        articles_map=articles_map
-    )
+    # 3. Stream Results: Process each as it completes
+    logger.info(f"Enriching and streaming {len(unique_uuids)} incident(s) for '{tenant_name}'...")
     
-    if all_incident_events:
-        logger.info(f"Sending {len(all_incident_events)} incident events to Wazuh for '{tenant_name}'.")
-        for event in all_incident_events:
-            try:
-                event_dict = dataclasses.asdict(event)
-                event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
-                event_dict["customer_name"] = tenant_name
-                event_dict["customer_uuid"] = tenant_uuid
-                await wazuh.send_incident(event_dict)
-                
-                # Update individual incident tracking
-                analyzer.update_incident_time(event.incident_uuid, event.last_contact)
-            except Exception as e:
-                logger.error(f"Failed to send incident {event.incident_uuid} to Wazuh: {e}")
+    for finished_task in asyncio.as_completed(tasks):
+        try:
+            res = await finished_task
+            inc_uuid = res.get('uuid')
+            raw_inc = uuid_to_raw.get(inc_uuid)
+            
+            if not raw_inc:
+                continue
+
+            # Map the single incident
+            mapped_events = analyzer.evaluate_incidents(
+                [raw_inc],
+                stix_data_map={inc_uuid: res['stix']},
+                details_map={inc_uuid: res['details']},
+                summary_map={inc_uuid: res['summary']},
+                articles_map={inc_uuid: res['articles']}
+            )
+
+            # Send to Wazuh
+            for event in mapped_events:
+                try:
+                    event_dict = dataclasses.asdict(event)
+                    event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
+                    event_dict["customer_name"] = tenant_name
+                    event_dict["customer_uuid"] = tenant_uuid
+                    
+                    await wazuh.send_incident(event_dict)
+                    
+                    # Update state immediately
+                    analyzer.update_incident_time(event.incident_uuid, event.last_contact)
+                except Exception as e:
+                    logger.error(f"Failed to send incident {event.incident_uuid} to Wazuh: {e}")
+
+        except Exception as e:
+            logger.error(f"Streaming error for an incident task: {e}")
 
 async def run_loop():
     settings = get_settings()
