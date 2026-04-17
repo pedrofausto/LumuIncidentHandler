@@ -1,7 +1,7 @@
-import time
 import logging
 import json
 import os
+from pathlib import Path
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -120,6 +120,7 @@ class Analyzer:
                     self.last_pulled_time = max_val
             else:
                 self.last_pulled_time = ""
+            self.offset = get_settings().lumu_initial_offset
         else:
             self.last_pulled_time: str = state_data.get('last_pulled_time', '')
             if not self.last_pulled_time:
@@ -164,15 +165,15 @@ class Analyzer:
     def _load_state(self) -> Dict[str, Any]:
         """Loads the alerted incidents from the JSON state file."""
         # Ensure the base directory is absolute and established at the root
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
-        abs_path = os.path.abspath(os.path.join(base_dir, os.path.basename(self._state_file)))
+        base_dir = Path(__file__).resolve().parent.parent / "data"
+        abs_path = (base_dir / Path(self._state_file).name).resolve()
 
         # Path traversal protection: Ensure the state file is strictly within the data directory
-        if not abs_path.startswith(base_dir + os.sep):
+        if not abs_path.is_relative_to(base_dir):
             logger.error(f"Security Alert: Path traversal attempt blocked for state file: {self._state_file}")
             return {}
 
-        if not os.path.exists(abs_path):
+        if not abs_path.exists():
             return {}
         try:
             with open(abs_path, 'r') as f:
@@ -188,19 +189,18 @@ class Analyzer:
         """Atomically saves the alerted incidents to the JSON state file."""
         try:
             # Ensure the base directory is absolute and established at the root
-            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
-            abs_path = os.path.abspath(os.path.join(base_dir, os.path.basename(self._state_file)))
+            base_dir = Path(__file__).resolve().parent.parent / "data"
+            abs_path = (base_dir / Path(self._state_file).name).resolve()
 
             # Path traversal protection
-            if not abs_path.startswith(base_dir + os.sep):
+            if not abs_path.is_relative_to(base_dir):
                 logger.error(f"Security Alert: Path traversal attempt blocked for state file: {self._state_file}")
                 return
 
-            parent_dir = os.path.dirname(abs_path)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
+            parent_dir = abs_path.parent
+            parent_dir.mkdir(parents=True, exist_ok=True)
             
-            temp_file = abs_path + ".tmp"
+            temp_file = str(abs_path) + ".tmp"
             # Secure file permissions (0o600)
             fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as f:
@@ -212,7 +212,7 @@ class Analyzer:
                 f.flush()
                 os.fsync(f.fileno())
 
-            os.replace(temp_file, abs_path)
+            os.replace(temp_file, str(abs_path))
         except (IOError, OSError) as e:
             logger.error(f"Failed to save state file {self._state_file}: {e}")
 
@@ -236,7 +236,7 @@ class Analyzer:
             if h > 0: return f"{h}h {m}m {s}s"
             if m > 0: return f"{m}m {s}s"
             return f"{s}s"
-        except: return None
+        except Exception: return None
 
     def _merge_workstations(self, sources: List[List[Dict[str, Any]]]) -> List[AffectedEndpoint]:
         """

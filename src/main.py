@@ -14,6 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("lumu_monitor")
 
 async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False) -> Dict[str, Any]:
@@ -217,40 +218,35 @@ async def process_and_send_batch(
 
 async def run_loop():
     settings = get_settings()
-    client = LumuSession()
-    analyzer = Analyzer()
-    wazuh = WazuhClient()
-
     interval_seconds = settings.polling_interval_minutes * 60
 
     logger.info(f"Lumu Incident Handler started.")
     logger.info(f"Monitoring customer: '{settings.customer_name}' ({settings.customer_uuid})")
 
     try:
-        await client.authenticate()
+        async with LumuSession() as client, WazuhClient() as wazuh:
+            analyzer = Analyzer()
+            await client.authenticate()
 
-        while True:
-            logger.info("--- Starting Incident Polling Cycle ---")
-            try:
-                await monitor_tenant(
-                    client=client,
-                    analyzer=analyzer,
-                    wazuh=wazuh,
-                    tenant_uuid=settings.customer_uuid,
-                    tenant_name=settings.customer_name,
-                    company_key=settings.lumu_defender_key.get_secret_value() if settings.lumu_defender_key else None,
-                )
-            except Exception as e:
-                logger.error(f"Critical error during polling cycle: {str(e)}")
+            while True:
+                logger.info("--- Starting Incident Polling Cycle ---")
+                try:
+                    await monitor_tenant(
+                        client=client,
+                        analyzer=analyzer,
+                        wazuh=wazuh,
+                        tenant_uuid=settings.customer_uuid,
+                        tenant_name=settings.customer_name,
+                        company_key=settings.lumu_defender_key.get_secret_value() if settings.lumu_defender_key else None,
+                    )
+                except Exception as e:
+                    logger.error(f"Critical error during polling cycle: {str(e)}")
 
-            logger.info(f"Cycle complete. Waiting {settings.polling_interval_minutes} minutes for next check.")
-            await asyncio.sleep(interval_seconds)
+                logger.info(f"Cycle complete. Waiting {settings.polling_interval_minutes} minutes for next check.")
+                await asyncio.sleep(interval_seconds)
 
     except asyncio.CancelledError:
         logger.info("Monitor interrupted. Shutting down gracefully...")
-    finally:
-        await client.close()
-        await wazuh.close()
 
 
 

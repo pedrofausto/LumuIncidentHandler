@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, SecretStr, EmailStr
 from typing import Optional
-import os
+from functools import lru_cache
 
 class Settings(BaseSettings):
     # Lumu Authentication
@@ -46,5 +46,6 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
+@lru_cache()
 def get_settings() -> Settings:
     return Settings()

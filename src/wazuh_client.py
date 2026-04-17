@@ -1,6 +1,6 @@
 import httpx
 import logging
-from typing import Dict, Any
+from typing import Any
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -12,7 +12,7 @@ class WazuhClient:
         self.auth = (self.settings.indexer_username, self.settings.indexer_password.get_secret_value())
         self.client = httpx.AsyncClient(timeout=30.0, verify=self.settings.verify_ssl)
 
-    async def send_incident(self, json_data: Dict[str, Any]) -> None:
+    async def send_incident(self, json_data: dict[str, Any]) -> None:
         """
         Sends enriched incident JSON to the Wazuh Indexer via Native Upsert.
         """
@@ -46,3 +46,9 @@ class WazuhClient:
 
     async def close(self):
         await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()

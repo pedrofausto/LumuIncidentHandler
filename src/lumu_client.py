@@ -2,9 +2,8 @@ import asyncio
 import httpx
 import logging
 import time
-import os
 import random
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -90,7 +89,8 @@ class LumuSession:
         headers: Optional[Dict[str, str]] = None, 
         params: Optional[Dict[str, Any]] = None, 
         json_data: Optional[Dict[str, Any]] = None,
-        auth_required: bool = True
+        auth_required: bool = True,
+        _auth_retry_depth: int = 0
     ) -> httpx.Response:
         """
         Generic request wrapper with exponential backoff and authentication handling.
@@ -140,11 +140,14 @@ class LumuSession:
                     continue
 
                 if response.status_code == 401 and auth_required:
+                    if _auth_retry_depth >= 2:
+                        logger.error(f"Max authentication retries reached to refresh 401 error at {url}")
+                        response.raise_for_status()
                     logger.warning(f"Received 401 Unauthorized for {url}. Refreshing token and retrying...")
                     await self.authenticate()
                     headers["Authorization"] = self.bearer_token
                     # Direct recursion for 401 retry to avoid complex loop logic
-                    return await self._request_with_retry(method, url, headers, params, json_data, auth_required)
+                    return await self._request_with_retry(method, url, headers, params, json_data, auth_required, _auth_retry_depth + 1)
 
                 response.raise_for_status()
                 return response
@@ -470,3 +473,9 @@ class LumuSession:
 
     async def close(self):
         await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
