@@ -27,7 +27,7 @@ The system communicates with three distinct Lumu API surfaces to build a complet
 
 The final stage of the pipeline is publishing to **Kafka**.
 
-- **Topic Name**: configured by required `KAFKA_TOPIC`.
+- **Topic Name**: computed per tenant as `cli-<normalized_customer_name>`.
 - **Ingestion Method**: Official Confluent Python client (`confluent-kafka`) with `Producer`, delivery callback polling, bounded delivery timeout, and final flush confirmation.
 - **Message Key**: `lumu.id` when available.
 - **Data Format**: Kafka message value is JSON with one field, `message`, that contains the stringified enriched incident payload.

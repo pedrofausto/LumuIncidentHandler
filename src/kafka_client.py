@@ -21,7 +21,6 @@ class KafkaClient:
                 "confluent-kafka is not installed. Install dependencies from requirements.txt before running the handler."
             )
         self.settings = get_settings()
-        self.topic = self.settings.kafka_topic
         self.producer = Producer(
             {
                 "bootstrap.servers": self.settings.kafka_bootstrap_servers,
@@ -29,7 +28,11 @@ class KafkaClient:
             }
         )
 
-    async def send_incident(self, json_data: dict[str, Any]) -> None:
+    async def send_incident(self, json_data: dict[str, Any], topic: str) -> None:
+        if not topic or not topic.strip():
+            raise RuntimeError("Kafka topic is required for publish")
+        topic = topic.strip()
+
         lumu_data = json_data.get("lumu") if isinstance(json_data.get("lumu"), dict) else {}
         incident_id = json_data.get("incident_uuid") or lumu_data.get("id")
         key = str(incident_id) if incident_id else None
@@ -55,7 +58,7 @@ class KafkaClient:
             )
 
         try:
-            self.producer.produce(self.topic, key=key, value=encoded_value, callback=delivery_report)
+            self.producer.produce(topic, key=key, value=encoded_value, callback=delivery_report)
         except BufferError as e:
             logger.error("Kafka producer local queue is full: %s", e)
             raise RuntimeError("Kafka producer local queue is full") from e
@@ -67,7 +70,7 @@ class KafkaClient:
         while not delivery_future.done():
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"Kafka delivery timeout for incident={incident_id} topic={self.topic} after "
+                    f"Kafka delivery timeout for incident={incident_id} topic={topic} after "
                     f"{self.settings.kafka_delivery_timeout_seconds}s"
                 )
             self.producer.poll(0.1)
@@ -78,7 +81,7 @@ class KafkaClient:
         remaining = self.producer.flush(timeout=self.settings.kafka_flush_timeout_seconds)
         if remaining != 0:
             raise RuntimeError(
-                f"Kafka flush timeout for incident={incident_id} topic={self.topic}, "
+                f"Kafka flush timeout for incident={incident_id} topic={topic}, "
                 f"{remaining} message(s) still pending"
             )
 

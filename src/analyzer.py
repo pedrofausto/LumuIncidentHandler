@@ -101,8 +101,10 @@ class IncidentEvent:
 
 
 class Analyzer:
-    def __init__(self):
-        self._state_file = get_settings().alert_state_file
+    def __init__(self, state_file_key: str = "default"):
+        base_state_file = Path(get_settings().alert_state_file).name
+        key = "".join(ch if ch.isalnum() else "_" for ch in state_file_key).strip("_") or "default"
+        self._state_file = f"{key}_{base_state_file}"
         state_data = self._load_state()
         
         # Schema Migration: If state_data lacks 'incidents' but has items, it's the old schema

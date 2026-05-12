@@ -39,18 +39,20 @@ The `main.py` script serves as the entry point, running an `asyncio` loop. It ma
 ### 2. Lumu Session (`src/lumu_client.py`)
 Handles all communication with Lumu's Managed and Defender APIs. 
 - **Managed API**: Handles JWT authentication and STIX 2.1 bundle retrieval.
+- **Tenant Bootstrap**: Discovers supervised tenants and fetches each tenant Defender API key once at bootstrap.
 - **Defender API**: Fetches incident lists, endpoint details, and context summaries.
 - **Contacts API**: Fetches affected endpoint records so payloads can include concrete `srchost` and `srcip` values when Lumu exposes them.
 - It implements a thread-safe `httpx.AsyncClient` for high-performance concurrent I/O.
 
 ### 3. Analyzer (`src/analyzer.py`)
 The logic engine that transforms raw API responses into actionable insights:
-- **High-Water Mark Retrieval**: Uses the `lastContact` timestamp of incidents to identify truly new or updated events, comparing them against `data/sent_incidents.json`.
+- **Per-Tenant High-Water Mark Retrieval**: Uses the `lastContact` timestamp of incidents to identify truly new or updated events, comparing them against tenant-scoped state files in `data/`.
 - **Enrichment**: Merges raw incident data with STIX objects (Malware, Indicators) and Lumu Context (MITRE Techniques, Playbooks).
 - **Metric Calculation**: Calculates critical KPIs like Mean Time to Disseminate (MTTD), MTTR (Response), and MTTR (Resolution).
 
 ### 4. Kafka Client (`src/kafka_client.py`)
 Responsible for publishing incidents to Kafka.
+- **Dynamic Topic Routing**: Topic is provided at runtime per tenant as `cli-<normalized_customer_name>`.
 - **Producer Delivery Guarantees**: Uses Confluent's official Python `Producer` with delivery callbacks, bounded polling until ack or timeout, and flush-based queue drain verification.
 - **Payload Contract**: Publishes a JSON value with one field, `message`, containing the stringified reshaped incident JSON payload.
 - **Partitioning Key**: Uses `lumu.id` as the Kafka message key when available.
@@ -58,5 +60,5 @@ Responsible for publishing incidents to Kafka.
 
 ### 5. Configuration (`src/config.py`)
 Uses `pydantic-settings` to manage environment-based configuration with strict type validation, handling secrets securely via `SecretStr`.
-- `KAFKA_TOPIC` is required at startup.
+- Multi-tenant runtime does not require a static `KAFKA_TOPIC`; topic routing is computed per tenant.
 - `KAFKA_DELIVERY_TIMEOUT_SECONDS` bounds how long one publish waits for broker acknowledgement.

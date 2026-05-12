@@ -10,7 +10,6 @@ Before starting, ensure you have the following:
 
 - **Docker & Docker Compose**: Installed and running on your host machine.
 - **Lumu Managed API Credentials**: Email and Password for an MSSP or Enterprise account.
-- **Lumu Defender API Key**: Obtained from the Lumu Portal under the "Integrations" or "Defender API" section.
 - **Kafka Environment**: The provided Docker Compose stack includes a local Kafka broker and Confluent Control Center UI.
 
 ---
@@ -28,13 +27,12 @@ The application uses an `.env` file for all runtime configurations.
     - `LUMU_EMAIL`: Your Lumu login email.
     - `LUMU_PASSWORD`: Your Lumu login password.
     - `LUMU_MSSP_UUID`: The UUID of your MSSP (visible in the URL or profile).
-    - `LUMU_DEFENDER_KEY`: The API key for the company being monitored.
-    - `CUSTOMER_UUID`: The specific UUID of the company to monitor.
+    - Tenant Defender keys are fetched dynamically per supervised customer at startup.
 
 4.  **Configure Kafka**:
     - `KAFKA_BOOTSTRAP_SERVERS`: For local host usage, `localhost:9092`.
-    - `KAFKA_TOPIC`: Defaults to `lumu-incidents`.
     - `KAFKA_CLIENT_ID`: Defaults to `lumu-incident-handler`.
+    - Topic is computed per tenant as `cli-<normalized_customer_name>`.
 
 5.  **Set SSL Policy**:
     - `VERIFY_SSL=False`: Recommended for SSL-intercepted corporate networks and self-signed local environments.
@@ -90,7 +88,7 @@ You should see messages indicating successful authentication and the start of th
 
 ### Verify Ingestion in Kafka
 1. Open Confluent Control Center at `http://localhost:9021`.
-2. Select the local cluster and open topic `lumu-incidents`.
+2. Select the local cluster and open tenant topics like `cli-grupoamil`.
 3. Confirm each record value contains a `message` field with stringified incident JSON.
 
 ---

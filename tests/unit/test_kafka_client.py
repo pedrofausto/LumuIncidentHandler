@@ -4,12 +4,18 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
-from pydantic import ValidationError
 
 from src.analyzer import Analyzer
 from src.config import Settings
 from src.kafka_client import KafkaClient
-from src.main import get_agent_id, get_primary_host_ip, process_and_send_batch, severity_to_rule_level, shape_kafka_payload
+from src.main import (
+    get_agent_id,
+    get_primary_host_ip,
+    normalize_customer_topic,
+    process_and_send_batch,
+    severity_to_rule_level,
+    shape_kafka_payload,
+)
 
 
 @pytest.fixture
@@ -52,9 +58,9 @@ async def test_send_incident_success_payload_and_key(mock_settings):
         with patch("src.kafka_client.Producer", return_value=producer):
             client = KafkaClient()
             payload = {"lumu": {"id": "inc-123"}, "rule": {"level": 14}}
-            await client.send_incident(payload)
+            await client.send_incident(payload, topic="cli-grupoamil")
 
-    assert captured["topic"] == mock_settings.kafka_topic
+    assert captured["topic"] == "cli-grupoamil"
     assert captured["key"] == "inc-123"
     wrapped = json.loads(captured["value"])
     assert isinstance(wrapped["message"], str)
@@ -75,7 +81,7 @@ async def test_send_incident_delivery_failure_raises(mock_settings):
         with patch("src.kafka_client.Producer", return_value=producer):
             client = KafkaClient()
             with pytest.raises(RuntimeError, match="Kafka delivery failed"):
-                await client.send_incident({"incident_uuid": "inc-123"})
+                await client.send_incident({"incident_uuid": "inc-123"}, topic="cli-grupoamil")
 
 
 @pytest.mark.anyio
@@ -92,7 +98,7 @@ async def test_send_incident_flush_timeout_raises(mock_settings):
         with patch("src.kafka_client.Producer", return_value=producer):
             client = KafkaClient()
             with pytest.raises(RuntimeError, match="Kafka flush timeout"):
-                await client.send_incident({"incident_uuid": "inc-123"})
+                await client.send_incident({"incident_uuid": "inc-123"}, topic="cli-grupoamil")
 
 
 @pytest.mark.anyio
@@ -118,7 +124,7 @@ async def test_send_incident_delivery_timeout_raises():
         with patch("src.kafka_client.Producer", return_value=producer):
             client = KafkaClient()
             with pytest.raises(RuntimeError, match="Kafka delivery timeout"):
-                await client.send_incident({"incident_uuid": "inc-timeout"})
+                await client.send_incident({"incident_uuid": "inc-timeout"}, topic="cli-grupoamil")
 
 
 @dataclasses.dataclass
@@ -189,46 +195,18 @@ class DummyKafka:
         self.should_fail = should_fail
         self.calls = []
 
-    async def send_incident(self, data):
-        self.calls.append(data)
+    async def send_incident(self, data, topic):
+        self.calls.append((data, topic))
         if self.should_fail:
             raise RuntimeError("send failure")
 
 
-def test_settings_fail_when_kafka_topic_missing():
-    with pytest.raises(ValidationError):
-        Settings(
-            lumu_email="test@example.com",
-            lumu_password="password",
-            lumu_mssp_uuid="uuid",
-            customer_uuid="customer_uuid",
-            _env_file=None,
-        )
-
-
-@pytest.mark.parametrize("topic", ["", "   "])
-def test_settings_fail_when_kafka_topic_blank(topic: str):
-    with pytest.raises(ValidationError):
-        Settings(
-            lumu_email="test@example.com",
-            lumu_password="password",
-            lumu_mssp_uuid="uuid",
-            customer_uuid="customer_uuid",
-            kafka_topic=topic,
-            _env_file=None,
-        )
-
-
-def test_settings_accept_valid_kafka_topic():
-    settings = Settings(
-        lumu_email="test@example.com",
-        lumu_password="password",
-        lumu_mssp_uuid="uuid",
-        customer_uuid="customer_uuid",
-        kafka_topic="valid-topic",
-        _env_file=None,
-    )
-    assert settings.kafka_topic == "valid-topic"
+def test_normalize_customer_topic():
+    assert normalize_customer_topic("Grupo Amil") == "cli-grupoamil"
+    assert normalize_customer_topic("BH Airport") == "cli-bhairport"
+    assert normalize_customer_topic("BH-Airport") == "cli-bhairport"
+    assert normalize_customer_topic("Acme! SOC #1") == "cli-acmesoc1"
+    assert normalize_customer_topic("   ") == ""
 
 
 def test_severity_to_rule_level_mapping():
@@ -434,27 +412,30 @@ async def test_process_and_send_batch_updates_state_only_after_success():
                                 tenant_uuid="tenant-1",
                                 tenant_name="Tenant",
                                 company_key="key",
+                                kafka_topic="cli-tenant",
                             )
 
     assert len(kafka.calls) == 1
-    assert kafka.calls[0]["lumu"]["id"] == "inc-1"
-    assert kafka.calls[0]["lumu"]["event_type"] == "NewIncidentCreated"
-    assert kafka.calls[0]["lumu"]["affected_endpoints"][0]["srchost"] == "workstation-1"
-    assert kafka.calls[0]["lumu"]["affected_endpoints"][0]["srcip"] == "10.0.0.10"
-    assert kafka.calls[0]["agent"] == {"name": "handler-host", "id": "agent-uuid", "ip": "10.0.0.5"}
-    assert kafka.calls[0]["rule"] == {
+    payload, topic = kafka.calls[0]
+    assert topic == "cli-tenant"
+    assert payload["lumu"]["id"] == "inc-1"
+    assert payload["lumu"]["event_type"] == "NewIncidentCreated"
+    assert payload["lumu"]["affected_endpoints"][0]["srchost"] == "workstation-1"
+    assert payload["lumu"]["affected_endpoints"][0]["srcip"] == "10.0.0.10"
+    assert payload["agent"] == {"name": "handler-host", "id": "agent-uuid", "ip": "10.0.0.5"}
+    assert payload["rule"] == {
         "level": "16",
         "id": "0000",
         "groups": ["lumu"],
         "description": "Lumu integration Rule",
     }
-    assert kafka.calls[0]["manager"] == {"name": "handler-host"}
-    assert "ss_groups" not in kafka.calls[0]
-    assert "ss_customer" not in kafka.calls[0]
-    assert "integration" not in kafka.calls[0]
-    assert "severity" not in kafka.calls[0]
-    assert kafka.calls[0]["product_name"] == "Lumu Defender"
-    assert kafka.calls[0]["timezone"] == "America/Sao_Paulo"
+    assert payload["manager"] == {"name": "handler-host"}
+    assert "ss_groups" not in payload
+    assert "ss_customer" not in payload
+    assert "integration" not in payload
+    assert "severity" not in payload
+    assert payload["product_name"] == "Lumu Defender"
+    assert payload["timezone"] == "America/Sao_Paulo"
     assert analyzer.updated == [("inc-1", "2026-04-10T00:00:00Z")]
 
 
@@ -486,14 +467,17 @@ async def test_process_and_send_batch_does_not_update_state_on_send_failure():
                                 tenant_uuid="tenant-1",
                                 tenant_name="Tenant",
                                 company_key="key",
+                                kafka_topic="cli-tenant",
                             )
 
     assert len(kafka.calls) == 1
-    assert kafka.calls[0]["lumu"]["id"] == "inc-1"
-    assert "integration" not in kafka.calls[0]
-    assert "severity" not in kafka.calls[0]
-    assert kafka.calls[0]["product_name"] == "Lumu Defender"
-    assert kafka.calls[0]["timezone"] == "America/Sao_Paulo"
+    payload, topic = kafka.calls[0]
+    assert topic == "cli-tenant"
+    assert payload["lumu"]["id"] == "inc-1"
+    assert "integration" not in payload
+    assert "severity" not in payload
+    assert payload["product_name"] == "Lumu Defender"
+    assert payload["timezone"] == "America/Sao_Paulo"
     assert analyzer.updated == []
 
 
@@ -526,6 +510,7 @@ async def test_process_and_send_batch_passes_contacts_to_analyzer():
                                 tenant_uuid="tenant-1",
                                 tenant_name="Tenant",
                                 company_key="key",
+                                kafka_topic="cli-tenant",
                             )
 
     assert analyzer.kwargs["contacts_map"] == {"inc-1": contacts}

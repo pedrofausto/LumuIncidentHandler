@@ -16,11 +16,18 @@ class Settings(BaseSettings):
 
     # Lumu Defender API
     lumu_defender_url: str = Field("https://defender.lumu.io", description="Base URL for Lumu Defender API")
-    lumu_defender_key: Optional[SecretStr] = Field(None, description="Defender API Key used as 'key' query param for incident endpoints")
-
-    # Customer to monitor - single company UUID
-    customer_uuid: str = Field(..., description="The UUID of the customer/tenant to monitor for incidents")
-    customer_name: str = Field("Unknown Customer", description="Human-readable name for the customer (used in alerts)")
+    lumu_defender_key: Optional[SecretStr] = Field(
+        None,
+        description="Legacy single-tenant Defender API key (unused in multi-tenant mode)",
+    )
+    customer_uuid: Optional[str] = Field(
+        None,
+        description="Legacy single-tenant customer UUID (unused in multi-tenant mode)",
+    )
+    customer_name: Optional[str] = Field(
+        None,
+        description="Legacy single-tenant customer name (unused in multi-tenant mode)",
+    )
 
     # Orchestration
     polling_interval_minutes: int = Field(5, description="Frequency of Lumu polling in minutes")
@@ -38,7 +45,10 @@ class Settings(BaseSettings):
 
     # Kafka Configuration
     kafka_bootstrap_servers: str = Field("localhost:9092", description="Kafka bootstrap servers list")
-    kafka_topic: str = Field(..., description="Kafka topic used to publish enriched incidents")
+    kafka_topic: Optional[str] = Field(
+        None,
+        description="Legacy static topic (unused in multi-tenant dynamic topic mode)",
+    )
     kafka_client_id: str = Field("lumu-incident-handler", description="Kafka producer client id")
     kafka_delivery_timeout_seconds: float = Field(15.0, description="Timeout in seconds waiting for per-message Kafka delivery callback")
     kafka_flush_timeout_seconds: float = Field(10.0, description="Timeout in seconds for producer flush after publish")
@@ -52,9 +62,11 @@ class Settings(BaseSettings):
 
     @field_validator("kafka_topic")
     @classmethod
-    def kafka_topic_must_not_be_blank(cls, value: str) -> str:
-        if not value or not value.strip():
-            raise ValueError("kafka_topic must be a non-empty string")
+    def kafka_topic_must_not_be_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not value.strip():
+            raise ValueError("kafka_topic must be a non-empty string when provided")
         return value
 
 

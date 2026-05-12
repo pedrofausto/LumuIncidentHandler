@@ -7,7 +7,7 @@ The LumuIncidentHandler follows a precise, asynchronous lifecycle to process and
 The application runs in a continuous `asyncio` loop, triggered at intervals defined by `POLLING_INTERVAL_MINUTES`. Each iteration follows this sequence:
 
 1.  **Authentication**: The system ensures a valid JWT for the Lumu Managed API is available.
-2.  **Discovery**: It queries the Defender API for all active incidents.
+2.  **Tenant Bootstrap + Discovery**: It discovers supervised tenants, loads Defender keys for new tenants, then queries the Defender API for active incidents per tenant.
 3.  **High-Water Mark Deduplication**: The `Analyzer` compares the `lastContact` timestamp of each incident against the `last_pulled_time` stored in `data/sent_incidents.json`. Only "new" or "updated" incidents proceed.
 4.  **Concurrent Enrichment**: For each qualifying incident, the system fetches:
     - **STIX 2.1 Intelligence**: Malware and Indicators from the Managed API.
@@ -15,8 +15,8 @@ The application runs in a continuous `asyncio` loop, triggered at intervals defi
     - **Incident Contacts**: Full affected endpoint records from the Defender API, used to populate host/IP pairs.
     - **Context Summary**: MITRE mappings and playbooks.
     - **External Articles**: Curated research articles.
-5.  **Transformation**: The `Analyzer` merges these data sources into a unified `IncidentEvent` model and calculates MTTR/MTTD metrics. The orchestrator then reshapes the Kafka payload so Lumu fields live under `lumu`, source endpoints expose `srchost`/`srcip`, and top-level routing fields such as `agent`, `rule`, `decoder`, `manager`, `ss_groups`, and `ss_customer` are present.
-6.  **Kafka Publish**: The `KafkaClient` publishes the enriched incident to Kafka as JSON with a single `message` field containing the stringified reshaped payload, then waits for a bounded delivery callback confirmation.
+5.  **Transformation**: The `Analyzer` merges these data sources into a unified `IncidentEvent` model and calculates MTTR/MTTD metrics. The orchestrator reshapes the Kafka payload so Lumu fields live under `lumu` and source endpoints expose `srchost`/`srcip`.
+6.  **Kafka Publish**: The `KafkaClient` publishes the enriched incident to Kafka as JSON with a single `message` field containing the stringified reshaped payload, to a tenant topic `cli-<normalized_customer_name>`, then waits for a bounded delivery callback confirmation.
 7.  **State Persistence**: Each incident timestamp is persisted only after a confirmed Kafka delivery. Failed or timed-out deliveries remain eligible for retry in later cycles.
 
 ## Request/Response Flow (Detailed)
@@ -43,7 +43,7 @@ Time       Main Orchestrator          Lumu APIs (Multiple)                      
  |                |                                |                              |
  | [Metrics Calc] | (Calculate MTTD/MTTR)          |                              |
  |                |                                |                              |
-|                |------------ PRODUCE (topic: KAFKA_TOPIC, key: lumu.id) ------>|
+|                |------------ PRODUCE (topic: cli-<tenant>, key: lumu.id) ------>|
 |                |                                |<--- Delivery Confirmation    |
 |                |                                |                              |
 | [Persistence]  | (Update incident state only on ack) |                          |

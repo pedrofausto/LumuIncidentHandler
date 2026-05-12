@@ -22,14 +22,11 @@ LUMU_EMAIL=your_user@example.com
 LUMU_PASSWORD=your_password
 LUMU_MSSP_UUID=your_mssp_uuid
 
-# Lumu Defender API
-LUMU_DEFENDER_KEY=your_defender_key
-CUSTOMER_UUID=target_company_uuid
-CUSTOMER_NAME="Target Company Name"
+# Multi-tenant mode
+# Tenant UUIDs and Defender keys are discovered dynamically from MSSP endpoints.
 
 # Kafka
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_TOPIC=lumu-incidents
 KAFKA_CLIENT_ID=lumu-incident-handler
 KAFKA_DELIVERY_TIMEOUT_SECONDS=15
 ```
@@ -60,13 +57,13 @@ The Docker deployment includes several security-hardening measures:
 | `LUMU_EMAIL` | - | Lumu MSSP Console email address. |
 | `LUMU_PASSWORD` | - | Lumu MSSP Console password. |
 | `LUMU_MSSP_UUID` | - | Unique UUID for the MSSP holding supervised companies. |
-| `LUMU_DEFENDER_KEY` | - | Defender API Key for incident endpoints. |
-| `CUSTOMER_UUID` | - | UUID of the specific tenant/company to monitor. |
+| `LUMU_DEFENDER_KEY` | - | Legacy single-tenant key (unused in multi-tenant runtime). |
+| `CUSTOMER_UUID` | - | Legacy single-tenant UUID (unused in multi-tenant runtime). |
 | `POLLING_INTERVAL_MINUTES`| `5` | Frequency of Lumu polling in minutes. |
 | `VERIFY_SSL` | `True` | Enable or disable SSL verification for all API clients. |
 | `ALERT_STATE_FILE` | `data/sent_incidents.json` | Path to the high-water mark tracking file. |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka bootstrap servers. |
-| `KAFKA_TOPIC` | - | Required topic used for incident publishing. |
+| `KAFKA_TOPIC` | - | Legacy static topic (unused in multi-tenant runtime). |
 | `KAFKA_CLIENT_ID` | `lumu-incident-handler` | Kafka producer client identifier. |
 | `KAFKA_DELIVERY_TIMEOUT_SECONDS` | `15` | Max time to wait for the Kafka delivery callback for one message. |
 | `KAFKA_FLUSH_TIMEOUT_SECONDS` | `10` | Max time to wait for producer flush after a successful delivery callback. |
@@ -83,7 +80,7 @@ docker-compose logs -f
 ```
 
 ### State Management
-The system tracks incident activity in `data/sent_incidents.json` using a **per-incident timestamp map**.
+The system tracks incident activity in tenant-scoped files under `data/` using a **per-incident timestamp map**.
 
 The state file schema:
 ```json
@@ -127,8 +124,8 @@ echo "{}" > data/sent_incidents.json
 ### Connectivity Checks
 If incidents are not appearing in Kafka UI:
 1. **Kafka Reachability**: Verify the container can reach `KAFKA_BOOTSTRAP_SERVERS` (usually port 9092).
-2. **Topic Check**: Ensure the configured `KAFKA_TOPIC` exists and receives messages.
-3. **Lumu API**: Confirm that `LUMU_DEFENDER_KEY` is valid and the incidents are visible in the Lumu Portal for the specific `CUSTOMER_UUID`.
+2. **Topic Check**: Ensure tenant topics like `cli-grupoamil` are being created and receiving messages.
+3. **Lumu API**: Confirm MSSP credentials are valid and tenant Defender key bootstrap succeeded in logs.
 4. **Delivery Timeout**: Check for `Kafka delivery timeout` log lines; those indicate the handler continued the cycle but did not receive a broker ack in time.
 
 The handler now logs:

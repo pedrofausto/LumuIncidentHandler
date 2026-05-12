@@ -2,11 +2,12 @@ import asyncio
 import logging
 import sys
 import dataclasses
+import re
 import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from .config import get_settings
 from .lumu_client import LumuSession
 from .analyzer import Analyzer
@@ -32,6 +33,14 @@ MOVED_LUMU_FIELDS = {
     "status",
     "event_type",
 }
+
+
+@dataclasses.dataclass
+class TenantRuntime:
+    tenant_uuid: str
+    tenant_name: str
+    defender_api_key: str
+    kafka_topic: str
 
 
 def get_agent_id() -> str:
@@ -67,6 +76,11 @@ def severity_to_rule_level(severity: str | None) -> str:
         "high": "16",
     }
     return severity_map.get(str(severity or "").strip().lower(), "8")
+
+
+def normalize_customer_topic(customer_name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]", "", (customer_name or "").lower())
+    return f"cli-{normalized}" if normalized else ""
 
 
 def _shape_affected_endpoint(endpoint: Dict[str, Any]) -> Dict[str, Any]:
@@ -186,7 +200,15 @@ async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: st
         logger.debug(f"Intelligence enrichment failed for incident {inc_uuid}: {e}")
         return {'uuid': inc_uuid, 'stix': {}, 'details': {}, 'contacts': [], 'summary': {}, 'articles': []}
 
-async def monitor_tenant(client: LumuSession, analyzer: Analyzer, kafka: KafkaClient, tenant_uuid: str, tenant_name: str, company_key: str):
+async def monitor_tenant(
+    client: LumuSession,
+    analyzer: Analyzer,
+    kafka: KafkaClient,
+    tenant_uuid: str,
+    tenant_name: str,
+    company_key: str,
+    kafka_topic: str,
+):
     """
     Monitors a single tenant for security incidents using a Hybrid Strategy:
     1. State Sync: Fetch all currently OPEN incidents.
@@ -216,6 +238,7 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, kafka: KafkaCl
                 tenant_uuid=tenant_uuid, 
                 tenant_name=tenant_name, 
                 company_key=company_key,
+                kafka_topic=kafka_topic,
                 is_bootstrap_mode=False # State sync is usually light enough
             )
             publish_success_count += success
@@ -254,6 +277,7 @@ async def monitor_tenant(client: LumuSession, analyzer: Analyzer, kafka: KafkaCl
                     tenant_uuid, 
                     tenant_name, 
                     company_key, 
+                    kafka_topic,
                     is_bootstrap_mode=is_bootstrap_mode
                 )
                 publish_success_count += success
@@ -294,6 +318,7 @@ async def process_and_send_batch(
     tenant_uuid: str, 
     tenant_name: str, 
     company_key: str,
+    kafka_topic: str,
     is_bootstrap_mode: bool = False
 )-> tuple[int, int]:
     """
@@ -367,12 +392,14 @@ async def process_and_send_batch(
                         agent_ip=agent_ip,
                     )
                     
-                    await kafka.send_incident(event_dict)
+                    await kafka.send_incident(event_dict, topic=kafka_topic)
                     success_count += 1
                     logger.info(
-                        "Incident publish success incident_uuid=%s topic=%s",
+                        "Incident publish success tenant_uuid=%s tenant_name=%s incident_uuid=%s topic=%s",
+                        tenant_uuid,
+                        tenant_name,
                         event.incident_uuid,
-                        settings.kafka_topic,
+                        kafka_topic,
                     )
                     
                     # Update state immediately
@@ -382,7 +409,7 @@ async def process_and_send_batch(
                     logger.error(
                         "Failed to send incident incident_uuid=%s topic=%s reason=%s delivery_timeout=%ss",
                         event.incident_uuid,
-                        settings.kafka_topic,
+                        kafka_topic,
                         e,
                         settings.kafka_delivery_timeout_seconds,
                     )
@@ -395,33 +422,129 @@ async def process_and_send_batch(
 async def run_loop():
     settings = get_settings()
     interval_seconds = settings.polling_interval_minutes * 60
+    analyzers_by_tenant: Dict[str, Analyzer] = {}
+    tenant_registry: Dict[str, TenantRuntime] = {}
 
     logger.info(f"Lumu Incident Handler started.")
-    logger.info(f"Monitoring customer: '{settings.customer_name}' ({settings.customer_uuid})")
     logger.info(
-        "Kafka runtime config bootstrap=%s topic=%s delivery_timeout=%ss flush_timeout=%ss",
+        "Kafka runtime config bootstrap=%s delivery_timeout=%ss flush_timeout=%ss",
         settings.kafka_bootstrap_servers,
-        settings.kafka_topic,
         settings.kafka_delivery_timeout_seconds,
         settings.kafka_flush_timeout_seconds,
     )
 
     try:
         async with LumuSession() as client, KafkaClient() as kafka:
-            analyzer = Analyzer()
             await client.authenticate()
+            logger.info("Bootstrapping multi-tenant Defender key cache...")
+
+            async def refresh_tenant_registry(force_full: bool = False) -> None:
+                tenants = await client.get_tenants(items=500, page=1)
+                logger.info("Discovered %s supervised tenant(s).", len(tenants))
+                discovered_uuids: set[str] = set()
+                key_fetch_success = 0
+                key_fetch_failed = 0
+
+                for tenant in tenants:
+                    tenant_uuid = str(tenant.get("uuid") or "").strip()
+                    tenant_name = str(tenant.get("name") or "").strip() or "unknown"
+                    if not tenant_uuid:
+                        continue
+                    discovered_uuids.add(tenant_uuid)
+
+                    topic = normalize_customer_topic(tenant_name)
+                    if not topic:
+                        key_fetch_failed += 1
+                        logger.error(
+                            "Skipping tenant due to invalid normalized topic tenant_uuid=%s tenant_name=%s",
+                            tenant_uuid,
+                            tenant_name,
+                        )
+                        continue
+
+                    if not force_full and tenant_uuid in tenant_registry:
+                        existing = tenant_registry[tenant_uuid]
+                        if existing.tenant_name != tenant_name or existing.kafka_topic != topic:
+                            tenant_registry[tenant_uuid] = TenantRuntime(
+                                tenant_uuid=tenant_uuid,
+                                tenant_name=tenant_name,
+                                defender_api_key=existing.defender_api_key,
+                                kafka_topic=topic,
+                            )
+                            logger.info(
+                                "Tenant metadata refreshed tenant_uuid=%s tenant_name=%s topic=%s",
+                                tenant_uuid,
+                                tenant_name,
+                                topic,
+                            )
+                        continue
+
+                    endpoint = (
+                        f"/api/msp/companies/{settings.lumu_mssp_uuid}/"
+                        f"supervised_companies/{tenant_uuid}/defender_api_key"
+                    )
+                    try:
+                        key_response = await client.get_with_auth(endpoint)
+                        defender_api_key = ""
+                        if isinstance(key_response, dict):
+                            defender_api_key = str(key_response.get("defender_api_key") or "").strip()
+                        if not defender_api_key:
+                            raise RuntimeError("defender_api_key missing")
+
+                        tenant_registry[tenant_uuid] = TenantRuntime(
+                            tenant_uuid=tenant_uuid,
+                            tenant_name=tenant_name,
+                            defender_api_key=defender_api_key,
+                            kafka_topic=topic,
+                        )
+                        analyzers_by_tenant.setdefault(tenant_uuid, Analyzer(state_file_key=tenant_uuid))
+                        key_fetch_success += 1
+                        logger.info(
+                            "Tenant key bootstrap success tenant_uuid=%s tenant_name=%s topic=%s",
+                            tenant_uuid,
+                            tenant_name,
+                            topic,
+                        )
+                    except Exception as exc:
+                        key_fetch_failed += 1
+                        logger.error(
+                            "Tenant key bootstrap failed tenant_uuid=%s tenant_name=%s reason=%s",
+                            tenant_uuid,
+                            tenant_name,
+                            exc,
+                        )
+
+                stale = set(tenant_registry.keys()) - discovered_uuids
+                for tenant_uuid in stale:
+                    tenant_registry.pop(tenant_uuid, None)
+                    analyzers_by_tenant.pop(tenant_uuid, None)
+                    logger.warning("Tenant removed from registry tenant_uuid=%s", tenant_uuid)
+
+                logger.info(
+                    "Tenant key bootstrap summary discovered=%s loaded=%s failed=%s active_registry=%s",
+                    len(discovered_uuids),
+                    key_fetch_success,
+                    key_fetch_failed,
+                    len(tenant_registry),
+                )
+
+            await refresh_tenant_registry(force_full=True)
 
             while True:
                 logger.info("--- Starting Incident Polling Cycle ---")
                 try:
-                    await monitor_tenant(
-                        client=client,
-                        analyzer=analyzer,
-                        kafka=kafka,
-                        tenant_uuid=settings.customer_uuid,
-                        tenant_name=settings.customer_name,
-                        company_key=settings.lumu_defender_key.get_secret_value() if settings.lumu_defender_key else None,
-                    )
+                    await refresh_tenant_registry(force_full=False)
+                    for tenant_uuid, runtime in list(tenant_registry.items()):
+                        analyzer = analyzers_by_tenant.setdefault(tenant_uuid, Analyzer(state_file_key=tenant_uuid))
+                        await monitor_tenant(
+                            client=client,
+                            analyzer=analyzer,
+                            kafka=kafka,
+                            tenant_uuid=runtime.tenant_uuid,
+                            tenant_name=runtime.tenant_name,
+                            company_key=runtime.defender_api_key,
+                            kafka_topic=runtime.kafka_topic,
+                        )
                 except Exception as e:
                     logger.error(f"Critical error during polling cycle: {str(e)}")
 
