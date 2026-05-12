@@ -11,7 +11,7 @@ Before starting, ensure you have the following:
 - **Docker & Docker Compose**: Installed and running on your host machine.
 - **Lumu Managed API Credentials**: Email and Password for an MSSP or Enterprise account.
 - **Lumu Defender API Key**: Obtained from the Lumu Portal under the "Integrations" or "Defender API" section.
-- **Wazuh/OpenSearch Environment**: Either a standalone instance or the ability to run the provided Docker Compose stack.
+- **Kafka Environment**: The provided Docker Compose stack includes a local Kafka broker and Confluent Control Center UI.
 
 ---
 
@@ -31,14 +31,14 @@ The application uses an `.env` file for all runtime configurations.
     - `LUMU_DEFENDER_KEY`: The API key for the company being monitored.
     - `CUSTOMER_UUID`: The specific UUID of the company to monitor.
 
-4.  **Configure Wazuh/Indexer**:
-    - `INDEXER_URL`: The full URL (e.g., `https://wazuh.indexer:9200`).
-    - `INDEXER_USERNAME`: Usually `admin`.
-    - `INDEXER_PASSWORD`: The password for your indexer user.
+4.  **Configure Kafka**:
+    - `KAFKA_BOOTSTRAP_SERVERS`: For local host usage, `localhost:9092`.
+    - `KAFKA_TOPIC`: Defaults to `lumu-incidents`.
+    - `KAFKA_CLIENT_ID`: Defaults to `lumu-incident-handler`.
 
 5.  **Set SSL Policy**:
-    - `VERIFY_SSL=True`: **Recommended for Production.** Requires a valid certificate chain.
-    - `VERIFY_SSL=False`: Use this if connecting to a local instance with self-signed certificates.
+    - `VERIFY_SSL=False`: Recommended for SSL-intercepted corporate networks and self-signed local environments.
+    - `VERIFY_SSL=True`: Enable only when your environment presents a trusted certificate chain.
 
 ---
 
@@ -57,8 +57,8 @@ Alternatively, `docker-compose` will handle the build automatically during the f
 
 ## 4. Deployment Modes
 
-### Mode A: Full Stack Deployment (Includes Wazuh)
-If you want to deploy the entire stack (Wazuh Manager, Indexer, Dashboard, and the Handler), use the provided `docker-compose.yml`:
+### Mode A: Full Stack Deployment (Includes Kafka + Control Center)
+If you want to deploy the full local development stack (Kafka, Control Center, and the Handler), use the provided `docker-compose.yml`:
 
 ```bash
 docker-compose up -d
@@ -68,9 +68,9 @@ docker-compose up -d
 > The full stack deployment includes pre-configured SSL certificates and volume persistence for indices.
 
 ### Mode B: Standalone Handler Deployment
-If you already have a Wazuh/OpenSearch cluster running, you only need to deploy the handler service. 
+If you already have a Kafka cluster running, you only need to deploy the handler service.
 
-1. Ensure your `.env` points to your external `INDEXER_URL`.
+1. Ensure your `.env` points to your external `KAFKA_BOOTSTRAP_SERVERS`.
 2. run:
 ```bash
 docker-compose up -d lumu-incident-handler
@@ -88,13 +88,10 @@ docker logs -f lumu-incident-handler
 ```
 You should see messages indicating successful authentication and the start of the "Incident Polling Cycle".
 
-### Verify Ingestion in Wazuh
-1. Log in to your Wazuh Dashboard / OpenSearch Dashboards.
-2. Navigate to **Dev Tools** and query the index:
-   ```http
-   GET /lumu-incidents-1.x/_search
-   ```
-3. Confirm that documents are appearing with `@timestamp` and `incident_uuid` fields.
+### Verify Ingestion in Kafka
+1. Open Confluent Control Center at `http://localhost:9021`.
+2. Select the local cluster and open topic `lumu-incidents`.
+3. Confirm each record value contains a `message` field with stringified incident JSON.
 
 ---
 
@@ -104,5 +101,5 @@ You should see messages indicating successful authentication and the start of th
 |---|---|---|
 | `SSL: CERTIFICATE_VERIFY_FAILED` | Internal certs but `VERIFY_SSL=True` | Set `VERIFY_SSL=False` in `.env` |
 | `401 Unauthorized` | Invalid Lumu Credentials | Double-check `.env` for typos in email/pass |
-| `Connection Refused (9200)` | Indexer not reachable | Check if the `wazuh.indexer` container is healthy |
+| `Connection Refused (9092)` | Kafka not reachable | Check if the `kafka` container is healthy |
 | No incidents found | High-water mark logic | Check `data/sent_incidents.json`. Clear it to force a full re-scan. |

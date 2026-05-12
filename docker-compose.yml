@@ -1,94 +1,47 @@
-version: '3.7'
-
 services:
-  wazuh.manager:
-    image: wazuh/wazuh-manager:4.7.2
-    hostname: wazuh.manager
-    container_name: wazuh-manager
-    restart: always
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 655360
-        hard: 655360
+  kafka:
+    image: confluentinc/cp-kafka:8.2.0
+    hostname: kafka
+    container_name: kafka
+    restart: unless-stopped
     ports:
-      - "1514:1514"
-      - "1515:1515"
-      - "514:514/udp"
-      - "55000:55000"
+      - "9092:9092"
     environment:
-      - INDEXER_URL=https://wazuh.indexer:9200
-      - INDEXER_USERNAME=admin
-      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecretPassword}
-      - FILEBEAT_SSL_VERIFICATION_MODE=full
-      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
-      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
-      - SSL_KEY=/etc/ssl/filebeat.key
-      - API_USERNAME=wazuh-wui
-      - API_PASSWORD=${API_PASSWORD:-MyS3cr37P450r.*-}
-    volumes:
-      - ./config/wazuh_indexer_ssl_certs/root-ca-manager.pem:/etc/ssl/root-ca.pem
-      - ./config/wazuh_indexer_ssl_certs/wazuh.manager.pem:/etc/ssl/filebeat.pem
-      - ./config/wazuh_indexer_ssl_certs/wazuh.manager-key.pem:/etc/ssl/filebeat.key
-      - ./config/wazuh_cluster/wazuh_manager.conf:/wazuh-config-mount/etc/ossec.conf
-      - wazuh-manager-data:/var/ossec/data
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:29093
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_MIN_INSYNC_REPLICAS=1
+      - KAFKA_DEFAULT_REPLICATION_FACTOR=1
+      - KAFKA_NUM_PARTITIONS=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
     networks:
       - lumu-net
 
-  wazuh.indexer:
-    image: wazuh/wazuh-indexer:4.7.2
-    hostname: wazuh.indexer
-    container_name: wazuh-indexer
-    restart: always
-    ports:
-      - "9200:9200"
-    environment:
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
-    volumes:
-      - wazuh-indexer-data:/var/lib/wazuh-indexer
-      - ./config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem
-      - ./config/wazuh_indexer_ssl_certs/wazuh.indexer-key.pem:/usr/share/wazuh-indexer/certs/wazuh.indexer.key
-      - ./config/wazuh_indexer_ssl_certs/wazuh.indexer.pem:/usr/share/wazuh-indexer/certs/wazuh.indexer.pem
-      - ./config/wazuh_indexer_ssl_certs/admin.pem:/usr/share/wazuh-indexer/certs/admin.pem
-      - ./config/wazuh_indexer_ssl_certs/admin-key.pem:/usr/share/wazuh-indexer/certs/admin-key.pem
-      - ./config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/opensearch.yml
-      - ./config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/opensearch-security/internal_users.yml
-    networks:
-      - lumu-net
-
-  wazuh.dashboard:
-    image: wazuh/wazuh-dashboard:4.7.2
-    hostname: wazuh.dashboard
-    container_name: wazuh-dashboard
-    restart: always
-    ports:
-      - 443:5601
-    environment:
-      - INDEXER_USERNAME=admin
-      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecretPassword}
-      - WAZUH_API_URL=https://wazuh.manager
-      - DASHBOARD_USERNAME=kibanaserver
-      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-kibanaserver}
-      - API_USERNAME=wazuh-wui
-      - API_PASSWORD=${API_PASSWORD:-MyS3cr37P450r.*-}
-    volumes:
-      - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem
-      - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem
-      - ./config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem
-      - ./config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml
-      - ./config/wazuh_dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+  control-center:
+    image: confluentinc/cp-enterprise-control-center-next-gen:2.5.0
+    hostname: control-center
+    container_name: control-center
+    restart: unless-stopped
     depends_on:
-      - wazuh.indexer
-      - wazuh.manager
+      - kafka
+    ports:
+      - "9021:9021"
+    environment:
+      - CONTROL_CENTER_BOOTSTRAP_SERVERS=kafka:29092
+      - CONTROL_CENTER_REPLICATION_FACTOR=1
+      - CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS=1
+      - CONTROL_CENTER_MODE_ENABLE=management
+      - CONTROL_CENTER_PROMETHEUS_ENABLE=false
+      - PORT=9021
     networks:
       - lumu-net
 
@@ -101,21 +54,21 @@ services:
     env_file:
       - .env
     environment:
-      - INDEXER_URL=https://wazuh.indexer:9200
-      - INDEXER_USERNAME=admin
-      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecretPassword}
-      - INDEXER_INDEX_NAME=${INDEXER_INDEX_NAME:-lumu-incidents-1.x}
+      - VERIFY_SSL=${VERIFY_SSL:-False}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_TOPIC=${KAFKA_TOPIC}
+      - KAFKA_CLIENT_ID=${KAFKA_CLIENT_ID:-lumu-incident-handler}
+      - KAFKA_DELIVERY_TIMEOUT_SECONDS=${KAFKA_DELIVERY_TIMEOUT_SECONDS:-15}
+      - KAFKA_FLUSH_TIMEOUT_SECONDS=${KAFKA_FLUSH_TIMEOUT_SECONDS:-10}
     volumes:
       - lumu-data:/app/data
     networks:
       - lumu-net
     depends_on:
-      - wazuh.manager
+      - kafka
 
 volumes:
   lumu-data:
-  wazuh-indexer-data:
-  wazuh-manager-data:
 
 networks:
   lumu-net:

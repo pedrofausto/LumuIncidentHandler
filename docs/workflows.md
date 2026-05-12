@@ -1,6 +1,6 @@
 # Operational Workflows
 
-The LumuIncidentHandler follows a precise, asynchronous lifecycle to process and enrich security incidents. This document details the sequence of events from discovery to Wazuh ingestion.
+The LumuIncidentHandler follows a precise, asynchronous lifecycle to process and enrich security incidents. This document details the sequence of events from discovery to Kafka publishing.
 
 ## The Polling Lifecycle
 
@@ -9,19 +9,20 @@ The application runs in a continuous `asyncio` loop, triggered at intervals defi
 1.  **Authentication**: The system ensures a valid JWT for the Lumu Managed API is available.
 2.  **Discovery**: It queries the Defender API for all active incidents.
 3.  **High-Water Mark Deduplication**: The `Analyzer` compares the `lastContact` timestamp of each incident against the `last_pulled_time` stored in `data/sent_incidents.json`. Only "new" or "updated" incidents proceed.
-4.  **Concurrent Enrichment**: For each qualifying incident, the system spawns concurrent tasks to fetch:
+4.  **Concurrent Enrichment**: For each qualifying incident, the system fetches:
     - **STIX 2.1 Intelligence**: Malware and Indicators from the Managed API.
     - **Incident Details**: Detailed asset/contact data from the Defender API.
+    - **Incident Contacts**: Full affected endpoint records from the Defender API, used to populate host/IP pairs.
     - **Context Summary**: MITRE mappings and playbooks.
     - **External Articles**: Curated research articles.
-5.  **Transformation**: The `Analyzer` merges these four data sources into a unified `IncidentEvent` model and calculates MTTR/MTTD metrics.
-6.  **Ingestion (Upsert)**: The `WazuhClient` transforms the event into a document and performs a **Native Upsert** to the Wazuh Indexer using the incident UUID as the key.
-7.  **State Persistence**: Once a cycle completes, the `last_pulled_time` is updated in the state file to the latest activity timestamp seen.
+5.  **Transformation**: The `Analyzer` merges these data sources into a unified `IncidentEvent` model and calculates MTTR/MTTD metrics. The orchestrator then reshapes the Kafka payload so Lumu fields live under `lumu`, source endpoints expose `srchost`/`srcip`, and top-level routing fields such as `agent`, `rule`, `decoder`, `manager`, `ss_groups`, and `ss_customer` are present.
+6.  **Kafka Publish**: The `KafkaClient` publishes the enriched incident to Kafka as JSON with a single `message` field containing the stringified reshaped payload, then waits for a bounded delivery callback confirmation.
+7.  **State Persistence**: Each incident timestamp is persisted only after a confirmed Kafka delivery. Failed or timed-out deliveries remain eligible for retry in later cycles.
 
 ## Request/Response Flow (Detailed)
 
 ```text
-Time       Main Orchestrator          Lumu APIs (Multiple)                 Wazuh Indexer
+Time       Main Orchestrator          Lumu APIs (Multiple)                      Kafka
  |                |                                |                              |
  | [Interval Start]                                |                              |
  |                |---- Auth (JWT) Request ------->|                              |
@@ -34,23 +35,25 @@ Time       Main Orchestrator          Lumu APIs (Multiple)                 Wazuh
  |                |                                |                              |
  |                |--+-- GET STIX Bundle --------->|                              |
  |                |  |-- GET Incident Details ---->|                              |
- | [Concurrent]   |  |-- GET Context Summary ---->|                              |
+ | [Concurrent]   |  |-- GET Contacts ----------->|                              |
+ |                |  |-- GET Context Summary ---->|                              |
  | [Enrichment]   |  |-- GET External Articles -->|                              |
  |                |  |                             |                              |
  |                |<-+-- Combined Results ---------|                              |
  |                |                                |                              |
  | [Metrics Calc] | (Calculate MTTD/MTTR)          |                              |
  |                |                                |                              |
- |                |------------ NATIVE UPSERT (_update) ------------------------->|
- |                |                                |<--- Document Created/Updated |
- |                |                                |                              |
- | [Persistence]  | (Update last_pulled_time)       |                              |
+|                |------------ PRODUCE (topic: KAFKA_TOPIC, key: lumu.id) ------>|
+|                |                                |<--- Delivery Confirmation    |
+|                |                                |                              |
+| [Persistence]  | (Update incident state only on ack) |                          |
  |                |                                |                              |
  v [Interval End] |                                |                              |
 ```
 
 ## Error Handling & Resiliency
 
-- **Graceful Enrichment**: If a specific enrichment API (like STIX or Articles) fails or returns 404, the system continues with the remaining data rather than aborting the incident.
-- **Wazuh Retries**: If the Wazuh Indexer is temporarily unavailable, the `WazuhClient` raises an exception, the high-water mark is **not** updated, and the system will attempt to process those incidents again in the next cycle.
+- **Graceful Enrichment**: If a specific enrichment API (like STIX, Contacts, or Articles) fails or returns 404, the system continues with the remaining data rather than aborting the incident.
+- **Kafka Retries**: If Kafka delivery fails or times out, the `KafkaClient` raises an exception, the per-incident state is **not** updated, and the system will attempt to process those incidents again in the next cycle.
 - **Auth Recovery**: JWT tokens are automatically refreshed upon expiration detected during any Managed API call.
+- **Cycle Liveness**: A single incident publish failure does not abort the batch; remaining incidents continue processing and the cycle ends with a success/failure summary log.

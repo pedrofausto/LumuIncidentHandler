@@ -32,8 +32,9 @@ class StixSighting:
 @dataclass
 class AffectedEndpoint:
     name: str
-    first_contact: str
-    last_contact: str
+    srcip: str = ""
+    first_contact: str = ""
+    last_contact: str = ""
 
 @dataclass
 class ThreatIntelArticle:
@@ -71,6 +72,7 @@ class IncidentEvent:
     adversary_id: str
     severity: str
     status: str
+    event_type: str
     first_contact: str
     last_contact: str
     endpoints_affected: int
@@ -152,6 +154,21 @@ class Analyzer:
         stored_ts = self._incident_times.get(uuid, '')
         
         return not stored_ts or (last_contact > stored_ts)
+
+    def classify_incident_event_type(self, raw_incident: Dict[str, Any]) -> str:
+        """
+        Normalizes Lumu event context to the two event types emitted downstream.
+        New incidents default to NewIncidentCreated when no journal context exists.
+        """
+        explicit_event_type = raw_incident.get("_lumu_event_type")
+        if explicit_event_type in {"NewIncidentCreated", "IncidentUpdated"}:
+            return explicit_event_type
+
+        uuid = raw_incident.get('id') or raw_incident.get('uuid')
+        if uuid and uuid not in self._incident_times:
+            return "NewIncidentCreated"
+
+        return "IncidentUpdated"
 
     def update_incident_time(self, uuid: str, timestamp: str):
         """Manually update the last seen time for a specific incident."""
@@ -241,7 +258,7 @@ class Analyzer:
     def _merge_workstations(self, sources: List[List[Dict[str, Any]]]) -> List[AffectedEndpoint]:
         """
         Deduplicates and merges assets from multiple sources.
-        Uses a tiered deduplication key: hostname (if present) OR ip_address.
+        Uses a tiered deduplication key: source IP (if present) OR hostname.
         Merges timelines: first_contact = min, last_contact = max.
         """
         merged: Dict[str, AffectedEndpoint] = {}
@@ -254,10 +271,32 @@ class Analyzer:
                 if not isinstance(item, dict):
                     continue
                 
-                # Tiered key: hostname (endpointName) OR ip_address (endpointIp)
-                name = item.get('endpointName') or item.get('endpointIp')
+                hostname = (
+                    item.get('endpointName')
+                    or item.get('hostname')
+                    or item.get('hostName')
+                    or item.get('name')
+                    or item.get('host')
+                    or item.get('deviceName')
+                    or ''
+                )
+                srcip = (
+                    item.get('endpointIp')
+                    or item.get('ip')
+                    or item.get('ipAddress')
+                    or item.get('srcip')
+                    or item.get('sourceIp')
+                    or item.get('sourceIP')
+                    or item.get('address')
+                    or ''
+                )
+                name = str(hostname or srcip).strip()
+                srcip = str(srcip or '').strip()
+                if not srcip and name and self._looks_like_ip(name):
+                    srcip = name
                 if not name:
                     continue
+                key = srcip or name
                 
                 # Try various timestamp fields
                 raw_ts = item.get('datetime') or item.get('timestamp') or item.get('firstContact') or item.get('lastContact')
@@ -270,24 +309,39 @@ class Analyzer:
                     except (ValueError, TypeError):
                         ts_dt = None
 
-                if name not in merged:
-                    merged[name] = AffectedEndpoint(
+                if key not in merged:
+                    merged[key] = AffectedEndpoint(
                         name=name,
+                        srcip=srcip,
                         first_contact=raw_ts or '',
                         last_contact=raw_ts or ''
                     )
                     # Store parsed objects for comparison in a temporary dict
-                    merged_dts[name] = {'first': ts_dt, 'last': ts_dt}
-                elif ts_dt:
+                    merged_dts[key] = {'first': ts_dt, 'last': ts_dt}
+                else:
+                    if srcip and not merged[key].srcip:
+                        merged[key].srcip = srcip
+                    if name and not merged[key].name:
+                        merged[key].name = name
+                if key in merged and ts_dt:
                     # Update first_contact if ts_dt is earlier
-                    if not merged_dts[name]['first'] or (ts_dt < merged_dts[name]['first']):
-                        merged_dts[name]['first'] = ts_dt
-                        merged[name].first_contact = raw_ts
+                    if not merged_dts[key]['first'] or (ts_dt < merged_dts[key]['first']):
+                        merged_dts[key]['first'] = ts_dt
+                        merged[key].first_contact = raw_ts
                     # Update last_contact if ts_dt is later
-                    if not merged_dts[name]['last'] or (ts_dt > merged_dts[name]['last']):
-                        merged_dts[name]['last'] = ts_dt
-                        merged[name].last_contact = raw_ts        
+                    if not merged_dts[key]['last'] or (ts_dt > merged_dts[key]['last']):
+                        merged_dts[key]['last'] = ts_dt
+                        merged[key].last_contact = raw_ts        
         return sorted(list(merged.values()), key=lambda x: x.name)
+
+    def _looks_like_ip(self, value: str) -> bool:
+        parts = value.split(".")
+        if len(parts) != 4:
+            return False
+        try:
+            return all(0 <= int(part) <= 255 for part in parts)
+        except ValueError:
+            return False
 
     def evaluate_incidents(self,
                            raw_incidents: List[Dict[str, Any]],
@@ -319,6 +373,7 @@ class Analyzer:
 
             severity   = inc.get('severity', 'High')
             status     = inc.get('status', 'open')
+            event_type = self.classify_incident_event_type(inc)
 
             # Metric Base Timestamps
             # Open Since (Incident Creation in Lumu)
@@ -428,27 +483,27 @@ class Analyzer:
             mtt_resolution = None
 
             det = details_map.get(uuid, {})
+            api_contacts_data = contacts_map.get(uuid, [])
+            api_contacts_list = []
+            if isinstance(api_contacts_data, dict):
+                api_contacts_list = api_contacts_data.get('contacts') or api_contacts_data.get('items') or []
+            elif isinstance(api_contacts_data, list):
+                api_contacts_list = api_contacts_data
+
+            det_contacts = det.get('contacts', []) if det else []
+            first_contact_details = det.get('firstContactDetails', {}) if det else {}
+            last_contact_details = det.get('lastContactDetails', {}) if det else {}
+
+            sources = [
+                api_contacts_list if isinstance(api_contacts_list, list) else [],
+                det_contacts if isinstance(det_contacts, list) else [],
+                [first_contact_details] if first_contact_details else [],
+                [last_contact_details] if last_contact_details else []
+            ]
+            
+            affected_endpoints = self._merge_workstations(sources)
+
             if det:
-                # 1. Extract unique endpoints with their timelines
-                api_contacts_data = contacts_map.get(uuid, [])
-                api_contacts_list = []
-                if isinstance(api_contacts_data, dict):
-                    api_contacts_list = api_contacts_data.get('contacts') or api_contacts_data.get('items') or []
-                elif isinstance(api_contacts_data, list):
-                    api_contacts_list = api_contacts_data
-
-                det_contacts = det.get('contacts', [])
-                first_contact_details = det.get('firstContactDetails', {})
-                last_contact_details = det.get('lastContactDetails', {})
-
-                sources = [
-                    api_contacts_list if isinstance(api_contacts_list, list) else [],
-                    det_contacts if isinstance(det_contacts, list) else [],
-                    [first_contact_details] if first_contact_details else [],
-                    [last_contact_details] if last_contact_details else []
-                ]
-                
-                affected_endpoints = self._merge_workstations(sources)
 
                 # 2. Parse Metrics from Actions
                 actions = det.get('actions', [])
@@ -496,6 +551,7 @@ class Analyzer:
                 adversary_id=adv_id,
                 severity=severity,
                 status=status,
+                event_type=event_type,
                 first_contact=first_contact,
                 last_contact=last_contact,
                 endpoints_affected=endpoints_count,
@@ -538,11 +594,13 @@ class Analyzer:
             event_type = next(iter(update.keys()))
             event_data = update[event_type]
             
-            if event_type in ["NewIncidentCreated", "IncidentClosed", "IncidentUnmuted", "IncidentMuted", "IncidentReopened"]:
+            if event_type in ["NewIncidentCreated", "IncidentUpdated", "IncidentClosed", "IncidentUnmuted", "IncidentMuted", "IncidentReopened"]:
                 incident_data = event_data.get("incident")
                 if incident_data:
-                    # Enrich with event type context if needed for downstream (e.g. status)
-                    incidents.append(incident_data)
+                    normalized_event_type = "NewIncidentCreated" if event_type == "NewIncidentCreated" else "IncidentUpdated"
+                    incident_with_context = dict(incident_data)
+                    incident_with_context["_lumu_event_type"] = normalized_event_type
+                    incidents.append(incident_with_context)
                 else:
                     logger.warning(f"Update event {event_type} missing incident data.")
             elif event_type == "OpenIncidentsStatusUpdated":

@@ -1,6 +1,6 @@
 # LumuIncidentHandler Architecture
 
-The LumuIncidentHandler is an asynchronous, polling-based security monitor designed to identify, enrich, and dispatch security incidents from the Lumu platform to a **Wazuh Indexer (OpenSearch)**. It automates the extraction of incident data, correlates it with STIX 2.1 threat intelligence/context, and ensures real-time visibility in SOC dashboards.
+The LumuIncidentHandler is an asynchronous, polling-based security monitor designed to identify, enrich, and dispatch security incidents from the Lumu platform to **Kafka**. It automates the extraction of incident data, correlates it with STIX 2.1 threat intelligence/context, and ensures real-time visibility for downstream consumers.
 
 ## System Architecture
 
@@ -19,14 +19,14 @@ The application is structured into four main functional blocks: Orchestration, A
 |           |                                                                     |
 |           v                                                                     |
 |   +--------------+         +-----------------+         +---------------------+  |
-|   |   Analyzer   |-------->| High-Water Mark |         |    Wazuh Indexer    |  |
-|   | (Enrichment) |         | (sent_incidents)|         |    (OpenSearch)     |  |
+|   |   Analyzer   |-------->| High-Water Mark |         |       Kafka         |  |
+|   | (Enrichment) |         | (sent_incidents)|         |                     |  |
 |   +-------+------+         +-----------------+         +----------+----------+  |
 |           |                                                       ^             |
 |           v                                                       |             |
 |   +--------------+                                                |             |
-|   | Wazuh Client |------------------------------------------------+             |
-|   |   (Upsert)   |                                                              |
+|   | Kafka Client |------------------------------------------------+             |
+|   |  (Producer)  |                                                              |
 |   +--------------+                                                              |
 +---------------------------------------------------------------------------------+
 ```
@@ -40,6 +40,7 @@ The `main.py` script serves as the entry point, running an `asyncio` loop. It ma
 Handles all communication with Lumu's Managed and Defender APIs. 
 - **Managed API**: Handles JWT authentication and STIX 2.1 bundle retrieval.
 - **Defender API**: Fetches incident lists, endpoint details, and context summaries.
+- **Contacts API**: Fetches affected endpoint records so payloads can include concrete `srchost` and `srcip` values when Lumu exposes them.
 - It implements a thread-safe `httpx.AsyncClient` for high-performance concurrent I/O.
 
 ### 3. Analyzer (`src/analyzer.py`)
@@ -48,10 +49,14 @@ The logic engine that transforms raw API responses into actionable insights:
 - **Enrichment**: Merges raw incident data with STIX objects (Malware, Indicators) and Lumu Context (MITRE Techniques, Playbooks).
 - **Metric Calculation**: Calculates critical KPIs like Mean Time to Disseminate (MTTD), MTTR (Response), and MTTR (Resolution).
 
-### 4. Wazuh Client (`src/wazuh_client.py`)
-Responsible for data ingestion into the Wazuh Indexer.
-- **Native Upsert**: Uses the OpenSearch `_update` API with `doc_as_upsert: true` to prevent duplicate records and ensure incident updates (e.g., new endpoints detected) are reflected in a single document.
-- **Schema Mapping**: Normalizes the internal `IncidentEvent` model into a format optimized for Wazuh/OpenSearch dashboards, including `@timestamp` injection.
+### 4. Kafka Client (`src/kafka_client.py`)
+Responsible for publishing incidents to Kafka.
+- **Producer Delivery Guarantees**: Uses Confluent's official Python `Producer` with delivery callbacks, bounded polling until ack or timeout, and flush-based queue drain verification.
+- **Payload Contract**: Publishes a JSON value with one field, `message`, containing the stringified reshaped incident JSON payload.
+- **Partitioning Key**: Uses `lumu.id` as the Kafka message key when available.
+- **Failure Semantics**: A timed-out or failed delivery raises an exception for that incident, leaves state unchanged for retry, and does not stall the handler loop.
 
 ### 5. Configuration (`src/config.py`)
 Uses `pydantic-settings` to manage environment-based configuration with strict type validation, handling secrets securely via `SecretStr`.
+- `KAFKA_TOPIC` is required at startup.
+- `KAFKA_DELIVERY_TIMEOUT_SECONDS` bounds how long one publish waits for broker acknowledgement.

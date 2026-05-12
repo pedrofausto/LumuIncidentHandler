@@ -1,22 +1,24 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, SecretStr, EmailStr
-from typing import Optional
 from functools import lru_cache
+from typing import Optional
+
+from pydantic import EmailStr, Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     # Lumu Authentication
     lumu_email: EmailStr = Field(..., description="The email address used to authenticate with Lumu MSSP Console")
     lumu_password: SecretStr = Field(..., description="The password for the Lumu MSSP Console account")
-    
+
     # Lumu API
     lumu_api_base_url: str = Field("https://managed.lumu.io", description="Base URL for Lumu managed console")
     lumu_mssp_uuid: str = Field(..., description="The unique UUID for the MSSP holding supervised companies")
-    
-    # New Lumu API Endpoints
+
+    # Lumu Defender API
     lumu_defender_url: str = Field("https://defender.lumu.io", description="Base URL for Lumu Defender API")
     lumu_defender_key: Optional[SecretStr] = Field(None, description="Defender API Key used as 'key' query param for incident endpoints")
 
-    # Customer to monitor — single company UUID
+    # Customer to monitor - single company UUID
     customer_uuid: str = Field(..., description="The UUID of the customer/tenant to monitor for incidents")
     customer_name: str = Field("Unknown Customer", description="Human-readable name for the customer (used in alerts)")
 
@@ -34,17 +36,27 @@ class Settings(BaseSettings):
     # Persistence
     alert_state_file: str = Field("data/sent_incidents.json", description="Path to the local JSON file for tracking notified incidents")
 
-    # Wazuh Indexer Configuration
-    indexer_url: str = Field(..., description="The Wazuh Indexer endpoint for incident ingestion")
-    indexer_username: str = Field("admin", description="The username for Wazuh Indexer authentication")
-    indexer_password: SecretStr = Field(..., description="The password for Wazuh Indexer authentication")
-    indexer_index_name: str = Field("lumu-incidents-1.x", description="The name of the index in Wazuh Indexer")
+    # Kafka Configuration
+    kafka_bootstrap_servers: str = Field("localhost:9092", description="Kafka bootstrap servers list")
+    kafka_topic: str = Field(..., description="Kafka topic used to publish enriched incidents")
+    kafka_client_id: str = Field("lumu-incident-handler", description="Kafka producer client id")
+    kafka_delivery_timeout_seconds: float = Field(15.0, description="Timeout in seconds waiting for per-message Kafka delivery callback")
+    kafka_flush_timeout_seconds: float = Field(10.0, description="Timeout in seconds for producer flush after publish")
+    payload_timezone: str = Field("UTC", description="Timezone label added to emitted Kafka payloads")
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
+
+    @field_validator("kafka_topic")
+    @classmethod
+    def kafka_topic_must_not_be_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("kafka_topic must be a non-empty string")
+        return value
+
 
 @lru_cache()
 def get_settings() -> Settings:

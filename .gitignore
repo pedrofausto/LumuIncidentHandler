@@ -24,6 +24,8 @@ src/*_new_method.py
 test_*.py
 test.py
 poc_*.py
+!tests/
+!tests/**/*.py
 
 # Ignore all .md files by default
 **/*.md
@@ -34,9 +36,7 @@ poc_*.py
 # scratch/ is ignored by default below
 
 # Unneeded execution and diagnostic files
-tmp_opensearch_dashboards.yml
 lumu_logs.txt
-indexer_logs.txt
 config/
 
 # Scratch and Temp directories

@@ -437,7 +437,8 @@ class LumuSession:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            return data.get('items', [])
+            contacts = data.get('contacts') or data.get('items') or data.get('data') or data.get('results') or []
+            return contacts if isinstance(contacts, list) else []
         return []
 
     async def get_secops_incident_details(self, company_uuid: str, incident_uuid: str) -> Dict[str, Any]:
