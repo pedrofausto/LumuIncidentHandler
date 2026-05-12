@@ -5,7 +5,6 @@ import dataclasses
 import re
 import socket
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from .config import get_settings
@@ -138,7 +137,7 @@ def shape_kafka_payload(
         "level": severity_to_rule_level(event_dict.get("severity")),
         "id": "0000",
         "groups": ["lumu"],
-        "description": "Lumu integration Rule",
+        "description": "Lumu integration rule",
     }
     payload["decoder"] = {
         "name": "int-dec-lumu",
@@ -155,7 +154,7 @@ async def _safe_enrichment(label: str, incident_uuid: str, operation, default):
     try:
         return await operation
     except Exception as exc:
-        logger.debug("%s enrichment failed for incident %s: %s", label, incident_uuid, exc)
+        logger.warning("%s enrichment failed for incident %s: %s", label, incident_uuid, exc)
         return default
 
 async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False) -> Dict[str, Any]:
@@ -249,6 +248,7 @@ async def monitor_tenant(
         # --- 2. Incremental Sync: Process Update Journal via Offset ---
         items_per_page = 50
         while True:
+            previous_offset = analyzer.offset
             pre_batch_hits = client.rate_limit_hits
             updates_data = await client.get_incident_updates(company_key, offset=analyzer.offset, items=items_per_page)
             updates_list = updates_data.get("updates", [])
@@ -259,6 +259,12 @@ async def monitor_tenant(
                 if new_offset is not None:
                     analyzer.offset = new_offset
                     analyzer._save_state()
+                else:
+                    logger.warning(
+                        "Journal updates returned no offset tenant=%s previous_offset=%s; stopping cycle",
+                        tenant_uuid,
+                        previous_offset,
+                    )
                 break
 
             logger.info(f"Retrieved {len(updates_list)} journal update event(s). Processing...")
@@ -286,6 +292,21 @@ async def monitor_tenant(
                 logger.info("No incident-related updates in this journal batch.")
 
             # Advance Offset and Persist State
+            if new_offset is None:
+                logger.warning(
+                    "Journal updates returned null offset tenant=%s previous_offset=%s; stopping cycle",
+                    tenant_uuid,
+                    previous_offset,
+                )
+                break
+            if new_offset == previous_offset:
+                logger.warning(
+                    "Journal offset did not advance tenant=%s offset=%s; stopping cycle to prevent infinite loop",
+                    tenant_uuid,
+                    previous_offset,
+                )
+                break
+
             analyzer.offset = new_offset
             analyzer._save_state()
             
@@ -379,7 +400,6 @@ async def process_and_send_batch(
             for event in mapped_events:
                 try:
                     event_dict = dataclasses.asdict(event)
-                    event_dict["@timestamp"] = datetime.now(timezone.utc).isoformat()
                     event_dict["customer_name"] = tenant_name
                     event_dict["customer_uuid"] = tenant_uuid
                     event_dict = shape_kafka_payload(

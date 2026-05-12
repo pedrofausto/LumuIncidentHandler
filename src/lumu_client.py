@@ -204,16 +204,17 @@ class LumuSession:
             return response_data[1]
         return []
 
-    async def get_mssp_activity(self, from_date: str, to_date: str, timezone: str = "America/Sao_Paulo") -> list:
+    async def get_mssp_activity(self, from_date: str, to_date: str, timezone: Optional[str] = None) -> list:
         """
         Endpoint C: Fetch high-level activity details across the MSSP.
         from_date and to_date format: 'YYYY-MM-DDTHH:MM:SS.MMM'
         """
         endpoint = "/data-api/companies/activity/msp"
+        resolved_timezone = timezone or self.settings.payload_timezone
         payload = {
             "from": from_date,
             "to": to_date,
-            "timezone": timezone
+            "timezone": resolved_timezone
         }
         return await self.post_with_auth(endpoint, json_data=payload)
 

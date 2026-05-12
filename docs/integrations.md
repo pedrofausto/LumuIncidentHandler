@@ -67,7 +67,7 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity 
     "level": "16",
     "id": "0000",
     "groups": ["lumu"],
-    "description": "Lumu integration Rule"
+    "description": "Lumu integration rule"
   },
   "decoder": {
     "name": "int-dec-lumu"

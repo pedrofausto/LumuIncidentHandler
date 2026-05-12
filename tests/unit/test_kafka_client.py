@@ -1,19 +1,23 @@
 import dataclasses
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.analyzer import Analyzer
 from src.config import Settings
 from src.kafka_client import KafkaClient
+from src.lumu_client import LumuSession
 from src.main import (
     get_agent_id,
     get_primary_host_ip,
+    monitor_tenant,
     normalize_customer_topic,
     process_and_send_batch,
     severity_to_rule_level,
+    _safe_enrichment,
     shape_kafka_payload,
 )
 
@@ -238,7 +242,6 @@ def test_shape_kafka_payload_moves_lumu_fields_and_preserves_context(mock_settin
         ],
         "stix_indicators": [{"name": "indicator"}],
         "mitre_techniques": [{"technique": "T1059"}],
-        "@timestamp": "2026-04-10T02:00:00+00:00",
         "integration": "legacy",
     }
 
@@ -271,7 +274,7 @@ def test_shape_kafka_payload_moves_lumu_fields_and_preserves_context(mock_settin
         "level": "16",
         "id": "0000",
         "groups": ["lumu"],
-        "description": "Lumu integration Rule",
+        "description": "Lumu integration rule",
     }
     assert payload["decoder"] == {"name": "int-dec-lumu"}
     assert payload["manager"] == {"name": "handler-host"}
@@ -284,6 +287,7 @@ def test_shape_kafka_payload_moves_lumu_fields_and_preserves_context(mock_settin
     assert "severity" not in payload
     assert "event_type" not in payload
     assert "incident_uuid" not in payload
+    assert "@timestamp" not in payload
 
 
 def test_shape_kafka_payload_defaults_lumu_event_type_for_new_incidents(mock_settings):
@@ -347,6 +351,47 @@ def test_analyzer_preserves_journal_event_context(tmp_path, mock_settings):
         {"id": "closed", "_lumu_event_type": "IncidentUpdated"},
         {"id": "reopened", "_lumu_event_type": "IncidentUpdated"},
     ]
+
+
+def test_analyzer_prunes_state_older_than_60_days_and_keeps_unparsable(tmp_path, mock_settings):
+    settings = mock_settings.model_copy(update={"alert_state_file": str(tmp_path / "unit_state_prune.json")})
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent_ts = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with patch("src.analyzer.get_settings", return_value=settings):
+        analyzer = Analyzer()
+        analyzer._incident_times = {
+            "old": old_ts,
+            "recent": recent_ts,
+            "legacy": "not-a-date",
+        }
+        analyzer._save_state()
+
+    assert "old" not in analyzer._incident_times
+    assert analyzer._incident_times["recent"] == recent_ts
+    assert analyzer._incident_times["legacy"] == "not-a-date"
+
+
+def test_analyzer_ip_validation_uses_ipaddress(tmp_path, mock_settings):
+    settings = mock_settings.model_copy(update={"alert_state_file": str(tmp_path / "unit_ip_state.json")})
+    with patch("src.analyzer.get_settings", return_value=settings):
+        analyzer = Analyzer()
+
+    assert analyzer._looks_like_ip("10.0.0.1") is True
+    assert analyzer._looks_like_ip("2001:db8::1") is True
+    assert analyzer._looks_like_ip("not-an-ip") is False
+
+
+@pytest.mark.anyio
+async def test_safe_enrichment_logs_warning_and_returns_default():
+    async def fail():
+        raise RuntimeError("boom")
+
+    with patch("src.main.logger.warning") as warning_mock:
+        result = await _safe_enrichment("details", "inc-1", fail(), {"fallback": True})
+
+    assert result == {"fallback": True}
+    warning_mock.assert_called_once()
 
 
 def test_get_agent_id_creates_and_reuses_uuid(tmp_path):
@@ -427,7 +472,7 @@ async def test_process_and_send_batch_updates_state_only_after_success():
         "level": "16",
         "id": "0000",
         "groups": ["lumu"],
-        "description": "Lumu integration Rule",
+        "description": "Lumu integration rule",
     }
     assert payload["manager"] == {"name": "handler-host"}
     assert "ss_groups" not in payload
@@ -514,3 +559,65 @@ async def test_process_and_send_batch_passes_contacts_to_analyzer():
                             )
 
     assert analyzer.kwargs["contacts_map"] == {"inc-1": contacts}
+
+
+@pytest.mark.anyio
+async def test_monitor_tenant_stops_when_offset_does_not_advance():
+    analyzer = Mock()
+    analyzer.last_pulled_time = "2026-05-01T00:00:00Z"
+    analyzer.offset = 12
+    analyzer.should_process_incident.return_value = False
+
+    client = Mock()
+    client.rate_limit_hits = 0
+    client.get_open_incidents = AsyncMock(return_value=[])
+    client.get_incident_updates = AsyncMock(side_effect=[
+        {"updates": [{"IncidentUpdated": {"incident": {"id": "inc-1"}}}], "offset": 12}
+    ])
+
+    with patch("src.main.process_and_send_batch", new=AsyncMock(return_value=(0, 0))) as batch_mock:
+        with patch("src.main.logger.warning") as warning_mock:
+            await monitor_tenant(
+                client=client,
+                analyzer=analyzer,
+                kafka=Mock(),
+                tenant_uuid="tenant-1",
+                tenant_name="Tenant",
+                company_key="k",
+                kafka_topic="cli-tenant",
+            )
+
+    assert batch_mock.call_count == 1
+    warning_mock.assert_called()
+    analyzer._save_state.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_get_mssp_activity_uses_settings_timezone_by_default(mock_settings):
+    with patch("src.lumu_client.get_settings", return_value=mock_settings.model_copy(update={"payload_timezone": "America/Sao_Paulo"})):
+        session = LumuSession()
+    session.post_with_auth = AsyncMock(return_value={"ok": True})
+
+    await session.get_mssp_activity("2026-05-01T00:00:00.000", "2026-05-02T00:00:00.000")
+
+    args, kwargs = session.post_with_auth.call_args
+    assert args[0] == "/data-api/companies/activity/msp"
+    assert kwargs["json_data"]["timezone"] == "America/Sao_Paulo"
+    await session.close()
+
+
+@pytest.mark.anyio
+async def test_get_mssp_activity_explicit_timezone_overrides_default(mock_settings):
+    with patch("src.lumu_client.get_settings", return_value=mock_settings.model_copy(update={"payload_timezone": "UTC"})):
+        session = LumuSession()
+    session.post_with_auth = AsyncMock(return_value={"ok": True})
+
+    await session.get_mssp_activity(
+        "2026-05-01T00:00:00.000",
+        "2026-05-02T00:00:00.000",
+        timezone="America/Sao_Paulo",
+    )
+
+    _, kwargs = session.post_with_auth.call_args
+    assert kwargs["json_data"]["timezone"] == "America/Sao_Paulo"
+    await session.close()

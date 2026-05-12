@@ -1,10 +1,11 @@
 import logging
 import json
 import os
+import ipaddress
 from pathlib import Path
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser
 from src.config import get_settings
 
@@ -207,6 +208,23 @@ class Analyzer:
     def _save_state(self):
         """Atomically saves the alerted incidents to the JSON state file."""
         try:
+            # Retain only recent incident timestamps to prevent unbounded state growth.
+            cutoff = datetime.now(timezone.utc) - timedelta(days=60)
+            pruned_incidents: Dict[str, str] = {}
+            for incident_uuid, raw_ts in self._incident_times.items():
+                try:
+                    parsed = parser.parse(str(raw_ts))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    else:
+                        parsed = parsed.astimezone(timezone.utc)
+                    if parsed >= cutoff:
+                        pruned_incidents[incident_uuid] = raw_ts
+                except (ValueError, TypeError, OverflowError):
+                    # Keep unparsable legacy entries to avoid accidental data loss.
+                    pruned_incidents[incident_uuid] = raw_ts
+            self._incident_times = pruned_incidents
+
             # Ensure the base directory is absolute and established at the root
             base_dir = Path(__file__).resolve().parent.parent / "data"
             abs_path = (base_dir / Path(self._state_file).name).resolve()
@@ -337,11 +355,9 @@ class Analyzer:
         return sorted(list(merged.values()), key=lambda x: x.name)
 
     def _looks_like_ip(self, value: str) -> bool:
-        parts = value.split(".")
-        if len(parts) != 4:
-            return False
         try:
-            return all(0 <= int(part) <= 255 for part in parts)
+            ipaddress.ip_address(value)
+            return True
         except ValueError:
             return False
 
