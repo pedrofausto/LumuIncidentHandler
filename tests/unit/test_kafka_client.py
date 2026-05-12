@@ -314,6 +314,32 @@ def test_shape_kafka_payload_defaults_lumu_event_type_for_new_incidents(mock_set
     assert "event_type" not in payload
 
 
+def test_shape_kafka_payload_forces_test_event_type_when_enabled(mock_settings):
+    test_mode_settings = mock_settings.model_copy(update={"event_type_test_mode": True})
+    payload = shape_kafka_payload(
+        event_dict={
+            "incident_uuid": "inc-1",
+            "title": "evil.example",
+            "adversary_type": "Malware",
+            "adversary_id": "evil.example",
+            "severity": "High",
+            "status": "open",
+            "event_type": "IncidentUpdated",
+            "endpoints_affected": 1,
+            "affected_endpoints": [],
+        },
+        tenant_uuid="tenant-1",
+        tenant_name="Tenant",
+        settings=test_mode_settings,
+        hostname="handler-host",
+        agent_id="agent-uuid",
+        agent_ip="10.0.0.5",
+    )
+
+    assert payload["lumu"]["event_type"] == "test"
+    assert "event_type" not in payload
+
+
 def test_analyzer_classifies_state_sync_event_types(tmp_path, mock_settings):
     settings = mock_settings.model_copy(update={"alert_state_file": str(tmp_path / "unit_event_type_state.json")})
 

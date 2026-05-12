@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     kafka_delivery_timeout_seconds: float = Field(15.0, description="Timeout in seconds waiting for per-message Kafka delivery callback")
     kafka_flush_timeout_seconds: float = Field(10.0, description="Timeout in seconds for producer flush after publish")
     payload_timezone: str = Field("UTC", description="Timezone label added to emitted Kafka payloads")
+    event_type_test_mode: bool = Field(False, description="If True, forces payload lumu.event_type to 'test'")
 
     model_config = SettingsConfigDict(
         env_file=".env",

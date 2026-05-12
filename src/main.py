@@ -126,7 +126,11 @@ def shape_kafka_payload(
             if isinstance(endpoint, dict)
         ],
         "status": event_dict.get("status", ""),
-        "event_type": event_dict.get("event_type") or "NewIncidentCreated",
+        "event_type": (
+            "test"
+            if settings.event_type_test_mode
+            else (event_dict.get("event_type") or "NewIncidentCreated")
+        ),
     }
     payload["agent"] = {
         "name": hostname,
