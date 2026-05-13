@@ -1,0 +1,26 @@
+services:
+  lumu-incident-handler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumu-incident-handler
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - VERIFY_SSL=${VERIFY_SSL:-False}
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - KAFKA_CLIENT_ID=${KAFKA_CLIENT_ID:-lumu-incident-handler}
+      - KAFKA_DELIVERY_TIMEOUT_SECONDS=${KAFKA_DELIVERY_TIMEOUT_SECONDS:-15}
+      - KAFKA_FLUSH_TIMEOUT_SECONDS=${KAFKA_FLUSH_TIMEOUT_SECONDS:-10}
+    volumes:
+      - lumu-data:/app/data
+    networks:
+      - lumu-net
+
+volumes:
+  lumu-data:
+
+networks:
+  lumu-net:
+    driver: bridge
