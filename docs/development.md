@@ -114,7 +114,7 @@ Kafka messages keep the outer wrapper:
 }
 ```
 
-Inside the stringified payload, Lumu-specific fields are grouped under `lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
+Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
 
 To re-process all incidents from the last 30 days, clear the state file:
 ```bash

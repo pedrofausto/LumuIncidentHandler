@@ -8,7 +8,7 @@ An automated monitor and alert system for the Lumu security platform. It polls f
 - **Rich Enrichment**: Merges raw incident data with STIX 2.1 objects (Indicators, Malware, Sightings).
 - **Intelligent Deduplication**: Uses a local JSON-based state file to ensure alerts are sent only once.
 - **Kafka Integration**: Publishes enriched incident payloads to Kafka using the official Confluent Python client.
-- **Structured Payloads**: Emits Lumu fields under `lumu`, endpoint host/IP pairs as `srchost`/`srcip`, and stable handler identity via `agent.id` plus detected `agent.ip`.
+- **Structured Payloads**: Emits Lumu fields under `data.lumu`, endpoint host/IP pairs as `srchost`/`srcip`, and stable handler identity via `agent.id` plus detected `agent.ip`.
 - **Bounded Delivery Acks**: Waits for per-message Kafka delivery confirmation with an explicit timeout, preventing handler stalls.
 - **Confluent Control Center UI**: Includes an official Kafka UI service for local message inspection.
 - **Docker-First Deployment**: Hardened Docker configuration with non-root user and persistent data volume.

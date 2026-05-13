@@ -55,7 +55,7 @@ Responsible for publishing incidents to Kafka.
 - **Dynamic Topic Routing**: Topic is provided at runtime per tenant as `cli-<normalized_customer_name>`.
 - **Producer Delivery Guarantees**: Uses Confluent's official Python `Producer` with delivery callbacks, bounded polling until ack or timeout, and flush-based queue drain verification.
 - **Payload Contract**: Publishes a JSON value with one field, `message`, containing the stringified reshaped incident JSON payload.
-- **Partitioning Key**: Uses `lumu.id` as the Kafka message key when available.
+- **Partitioning Key**: Uses `data.lumu.id` as the Kafka message key when available.
 - **Failure Semantics**: A timed-out or failed delivery raises an exception for that incident, leaves state unchanged for retry, and does not stall the handler loop.
 
 ### 5. Configuration (`src/config.py`)

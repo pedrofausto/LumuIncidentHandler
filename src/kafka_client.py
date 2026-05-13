@@ -33,7 +33,8 @@ class KafkaClient:
             raise RuntimeError("Kafka topic is required for publish")
         topic = topic.strip()
 
-        lumu_data = json_data.get("lumu") if isinstance(json_data.get("lumu"), dict) else {}
+        data = json_data.get("data") if isinstance(json_data.get("data"), dict) else {}
+        lumu_data = data.get("lumu") if isinstance(data.get("lumu"), dict) else {}
         incident_id = json_data.get("incident_uuid") or lumu_data.get("id")
         key = str(incident_id) if incident_id else None
 

@@ -29,34 +29,53 @@ The final stage of the pipeline is publishing to **Kafka**.
 
 - **Topic Name**: computed per tenant as `cli-<normalized_customer_name>`.
 - **Ingestion Method**: Official Confluent Python client (`confluent-kafka`) with `Producer`, delivery callback polling, bounded delivery timeout, and final flush confirmation.
-- **Message Key**: `lumu.id` when available.
+- **Message Key**: `data.lumu.id` when available.
 - **Data Format**: Kafka message value is JSON with one field, `message`, that contains the stringified enriched incident payload.
 - **Failure Behavior**: If a delivery callback is not received before `KAFKA_DELIVERY_TIMEOUT_SECONDS`, the publish fails explicitly and the incident is retried in a later cycle because state is not advanced.
 
 ### Kafka Payload Shape
 
-The pre-stringify payload is reshaped before publishing. Lumu-specific identity and endpoint fields are grouped under `lumu`; operational routing fields remain at the top level.
+The pre-stringify payload is reshaped before publishing. Lumu-specific identity, enrichment, and endpoint fields are grouped under `data.lumu`; operational routing fields remain at the top level.
 
 ```json
 {
-  "lumu": {
-    "id": "incident-uuid",
-    "adversaries": "threat title",
-    "adversary_id": "indicator-or-adversary-id",
-    "adversary_types": "Malware",
-    "company_id": "customer-uuid",
-    "customer_name": "Customer Name",
-    "endpoints_affected": 8,
-    "affected_endpoints": [
-      {
-        "srchost": "source-hostname-or-ip",
-        "srcip": "10.0.0.10",
-        "first_contact": "2026-05-06T14:50:43.864Z",
-        "last_contact": "2026-05-06T15:10:00.000Z"
-      }
-    ],
-    "status": "open",
-    "event_type": "NewIncidentCreated"
+  "data": {
+    "lumu": {
+      "id": "incident-uuid",
+      "adversaries": "threat title",
+      "adversary_id": "indicator-or-adversary-id",
+      "adversary_types": "Malware",
+      "company_id": "customer-uuid",
+      "customer_name": "Customer Name",
+      "endpoints_affected": 8,
+      "affected_endpoints": [
+        {
+          "srchost": "source-hostname-or-ip",
+          "srcip": "10.0.0.10",
+          "first_contact": "2026-05-06T14:50:43.864Z",
+          "last_contact": "2026-05-06T15:10:00.000Z"
+        }
+      ],
+      "status": "open",
+      "event_type": "NewIncidentCreated",
+      "details": "incident description",
+      "mitre_techniques": [],
+      "related_artifacts": {},
+      "recommended_playbooks": [],
+      "intelligence_tags": [],
+      "intelligence_articles": [],
+      "extracted_iocs": [],
+      "disseminated": false,
+      "dissemination_time": null,
+      "dissemination_latency": null,
+      "mtt_response": null,
+      "mtt_resolution": null,
+      "triggered_integrations": [],
+      "tlp": "TLP: RED",
+      "stix_indicators": [],
+      "stix_malware": [],
+      "stix_sighting": null
+    }
   },
   "agent": {
     "name": "handler-hostname",
@@ -80,7 +99,7 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity 
 }
 ```
 
-Rule level mapping is `Low="3"`, `Medium="8"`, `High="16"`, with unknown values defaulting to `"8"`. `lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; new incidents default to `NewIncidentCreated` when they are not already present in local state. When `EVENT_TYPE_TEST_MODE=true`, `lumu.event_type` is forced to `"test"` for debugging. The `integration`, top-level `severity`, top-level `event_type`, `ss_groups`, and `ss_customer` fields are not emitted.
+Rule level mapping is `Low="3"`, `Medium="8"`, `High="16"`, with unknown values defaulting to `"8"`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; new incidents default to `NewIncidentCreated` when they are not already present in local state. When `EVENT_TYPE_TEST_MODE=true`, `data.lumu.event_type` is forced to `"test"` for debugging. The `integration`, top-level `severity`, top-level `event_type`, `ss_groups`, and `ss_customer` fields are not emitted.
 
 ---
 
@@ -90,20 +109,22 @@ All raw data is normalized into the `IncidentEvent` model.
 
 | Category | Field | Source | Description |
 |---|---|---|---|
-| **Identity** | `lumu.id` | Defender API | Unique Lumu identifier. |
-| | `lumu.adversaries` | Defender API | Human-readable threat name. |
+| **Identity** | `data.lumu.id` | Defender API | Unique Lumu identifier. |
+| | `data.lumu.adversaries` | Defender API | Human-readable threat name. |
 | **Status** | `severity` | Defender API | Threat level (High/Medium/Low). |
-| | `lumu.status` | Defender API | Lifecycle status (open/closed). |
-| | `lumu.event_type` | Internal/Lumu Journal | Normalized event type: `NewIncidentCreated` or `IncidentUpdated`. |
+| | `data.lumu.status` | Defender API | Lifecycle status (open/closed). |
+| | `data.lumu.event_type` | Internal/Lumu Journal | Normalized event type: `NewIncidentCreated` or `IncidentUpdated`. |
 | **Timelines** | `first_contact` | Defender API | First recorded sighting. |
 | | `last_contact` | Defender API | Most recent recorded sighting. |
-| **Asset Context**| `lumu.endpoints_affected`| Defender API | Total count of impacted devices reported by Lumu. |
-| | `lumu.affected_endpoints`| Defender API | Concrete endpoint records from contacts/details APIs, including `srchost` and `srcip`. |
-| **Intelligence** | `mitre_techniques` | Context API | MITRE ATT&CK Tactic/Technique mapping. |
-| | `stix_indicators` | STIX Bundle | Patterns and IOCs from the STIX bundle. |
-| | `tlp` | STIX Bundle | Traffic Light Protocol level. |
-| **Response** | `recommended_playbooks`| Context API | Suggested SOPs for remediation. |
-| | `triggered_integrations`| Defender Details| Third-party tools already notified by Lumu. |
-| **Metrics** | `dissemination_latency`| Internal | Time from Detection to Automated Response (MTTD). |
-| | `mtt_response` | Internal | Time from Sighting to Automated Response. |
-| | `mtt_resolution` | Internal | Time from Sighting to Closure. |
+| **Asset Context**| `data.lumu.endpoints_affected`| Defender API | Total count of impacted devices reported by Lumu. |
+| | `data.lumu.affected_endpoints`| Defender API | Concrete endpoint records from contacts/details APIs, including `srchost` and `srcip`. |
+| **Intelligence** | `data.lumu.mitre_techniques` | Context API | MITRE ATT&CK Tactic/Technique mapping. |
+| | `data.lumu.extracted_iocs` | Context API | Extracted IOCs and parsed domains from summary enrichment. |
+| | `data.lumu.stix_indicators` | STIX Bundle | Patterns and IOCs from the STIX bundle. |
+| | `data.lumu.tlp` | STIX Bundle | Traffic Light Protocol level. |
+| **Response** | `data.lumu.recommended_playbooks`| Context API | Suggested SOPs for remediation. |
+| | `data.lumu.triggered_integrations`| Defender Details| Third-party tools already notified by Lumu. |
+| | `data.lumu.disseminated`| Defender Details| Whether an automated response action was observed. |
+| **Metrics** | `data.lumu.dissemination_latency`| Internal | Time from Detection to Automated Response (MTTD). |
+| | `data.lumu.mtt_response` | Internal | Time from Sighting to Automated Response. |
+| | `data.lumu.mtt_resolution` | Internal | Time from Sighting to Closure. |

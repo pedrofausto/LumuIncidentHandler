@@ -31,6 +31,23 @@ MOVED_LUMU_FIELDS = {
     "affected_endpoints",
     "status",
     "event_type",
+    "details",
+    "mitre_techniques",
+    "recommended_playbooks",
+    "intelligence_tags",
+    "intelligence_articles",
+    "disseminated",
+    "dissemination_time",
+    "dissemination_latency",
+    "mtt_response",
+    "mtt_resolution",
+    "triggered_integrations",
+    "tlp",
+    "related_artifacts",
+    "extracted_iocs",
+    "stix_indicators",
+    "stix_malware",
+    "stix_sighting",
 }
 
 
@@ -112,25 +129,44 @@ def shape_kafka_payload(
     }
 
     affected_endpoints = event_dict.get("affected_endpoints") or []
-    payload["lumu"] = {
-        "id": event_dict.get("incident_uuid", ""),
-        "adversaries": event_dict.get("title", ""),
-        "adversary_id": event_dict.get("adversary_id", ""),
-        "adversary_types": event_dict.get("adversary_type", ""),
-        "company_id": event_dict.get("customer_uuid") or tenant_uuid,
-        "customer_name": event_dict.get("customer_name") or tenant_name,
-        "endpoints_affected": event_dict.get("endpoints_affected", 0),
-        "affected_endpoints": [
-            _shape_affected_endpoint(endpoint)
-            for endpoint in affected_endpoints
-            if isinstance(endpoint, dict)
-        ],
-        "status": event_dict.get("status", ""),
-        "event_type": (
-            "test"
-            if settings.event_type_test_mode
-            else (event_dict.get("event_type") or "NewIncidentCreated")
-        ),
+    payload["data"] = {
+        "lumu": {
+            "id": event_dict.get("incident_uuid", ""),
+            "adversaries": event_dict.get("title", ""),
+            "adversary_id": event_dict.get("adversary_id", ""),
+            "adversary_types": event_dict.get("adversary_type", ""),
+            "company_id": event_dict.get("customer_uuid") or tenant_uuid,
+            "customer_name": event_dict.get("customer_name") or tenant_name,
+            "endpoints_affected": event_dict.get("endpoints_affected", 0),
+            "affected_endpoints": [
+                _shape_affected_endpoint(endpoint)
+                for endpoint in affected_endpoints
+                if isinstance(endpoint, dict)
+            ],
+            "status": event_dict.get("status", ""),
+            "event_type": (
+                "test"
+                if settings.event_type_test_mode
+                else (event_dict.get("event_type") or "NewIncidentCreated")
+            ),
+            "details": event_dict.get("details", ""),
+            "mitre_techniques": event_dict.get("mitre_techniques", []),
+            "related_artifacts": event_dict.get("related_artifacts", {}),
+            "recommended_playbooks": event_dict.get("recommended_playbooks", []),
+            "intelligence_tags": event_dict.get("intelligence_tags", []),
+            "intelligence_articles": event_dict.get("intelligence_articles", []),
+            "extracted_iocs": event_dict.get("extracted_iocs", []),
+            "disseminated": event_dict.get("disseminated", False),
+            "dissemination_time": event_dict.get("dissemination_time"),
+            "dissemination_latency": event_dict.get("dissemination_latency"),
+            "mtt_response": event_dict.get("mtt_response"),
+            "mtt_resolution": event_dict.get("mtt_resolution"),
+            "triggered_integrations": event_dict.get("triggered_integrations", []),
+            "tlp": event_dict.get("tlp", "TLP: RED"),
+            "stix_indicators": event_dict.get("stix_indicators", []),
+            "stix_malware": event_dict.get("stix_malware", []),
+            "stix_sighting": event_dict.get("stix_sighting"),
+        }
     }
     payload["agent"] = {
         "name": hostname,
