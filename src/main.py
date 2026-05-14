@@ -23,6 +23,7 @@ logger = logging.getLogger("lumu_monitor")
 MOVED_LUMU_FIELDS = {
     "incident_uuid",
     "title",
+    "adversaries",
     "adversary_id",
     "adversary_type",
     "customer_uuid",

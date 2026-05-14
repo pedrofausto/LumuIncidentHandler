@@ -50,6 +50,7 @@ def test_shape_kafka_payload_nests_lumu_fields_under_data():
     event_dict = {
         "incident_uuid": "incident-123",
         "title": "Threat title",
+        "adversaries": ["example.com"],
         "adversary_id": "adv-1",
         "adversary_type": "Malware",
         "customer_uuid": "tenant-123",
@@ -116,6 +117,7 @@ def test_shape_kafka_payload_nests_lumu_fields_under_data():
     assert payload["product_name"] == "Lumu Defender"
     assert payload["timezone"] == "UTC"
     assert "details" not in payload
+    assert "adversaries" not in payload
     assert "disseminated" not in payload
     assert "extracted_iocs" not in payload
 
