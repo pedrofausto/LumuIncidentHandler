@@ -61,6 +61,21 @@ The Docker deployment includes several security-hardening measures:
 | `CUSTOMER_UUID` | - | Legacy single-tenant UUID (unused in multi-tenant runtime). |
 | `POLLING_INTERVAL_MINUTES`| `5` | Frequency of Lumu polling in minutes. |
 | `VERIFY_SSL` | `True` | Enable or disable SSL verification for all API clients. |
+| `LUMU_OPEN_STATE_RECONCILIATION_MINUTES` | `15` | How often each tenant runs a full open-incident reconciliation sweep. |
+| `LUMU_OPEN_STATE_JITTER_SECONDS` | `120` | Per-tenant jitter applied to the reconciliation schedule to avoid burst scans. |
+| `LUMU_OPEN_STATE_FAILURE_BACKOFF_MINUTES` | `30` | Base scheduler backoff after a failed reconciliation sweep. |
+| `LUMU_OPEN_STATE_MAX_BACKOFF_MINUTES` | `360` | Maximum scheduler backoff after repeated reconciliation failures. |
+| `LUMU_OPEN_STATE_SYNC_ON_STARTUP` | `True` | Whether a tenant performs reconciliation before relying on journal-only polling. |
+| `LUMU_TENANT_CONCURRENCY_CAP` | `3` | Max number of tenants processed concurrently in a polling cycle. |
+| `LUMU_TENANT_CYCLE_JITTER_MAX_SECONDS` | `5` | Max random delay before each tenant run in a cycle to reduce synchronized API bursts. |
+| `LUMU_DEFENDER_BUDGET_ENFORCE` | `True` | Enables Defender minute/day budget gating before Defender API requests. |
+| `LUMU_DEFENDER_BUDGET_MINUTE_LIMIT` | `35` | Conservative per-tenant Defender budget per minute (published limit is 50/min). |
+| `LUMU_DEFENDER_BUDGET_DAY_LIMIT` | `8000` | Conservative per-tenant Defender budget per UTC day (published limit is 10,000/day). |
+| `LUMU_JOURNAL_ITEMS_PER_PAGE` | `100` | Requested item count for `open-incidents/updates` journal polling. |
+| `LUMU_JOURNAL_DELAY_TIME_SECONDS` | `15` | Long-poll delay (`time`) used on Defender journal calls. |
+| `LUMU_JOURNAL_MAX_PAGES_PER_CYCLE` | `2` | Maximum journal pages processed for one tenant in a single cycle. |
+| `LUMU_DEFENDER_USE_MAX_ITEMS_PARAM` | `True` | Enables adding `max-items` on supported Defender list endpoints. |
+| `LUMU_DEFENDER_MAX_ITEMS_PARAM` | `500` | Value sent as `max-items` when enabled and endpoint supports it. |
 | `ALERT_STATE_FILE` | `data/sent_incidents.json` | Path to the high-water mark tracking file. |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka bootstrap servers. |
 | `KAFKA_TOPIC` | - | Legacy static topic (unused in multi-tenant runtime). |
@@ -86,9 +101,13 @@ The state file schema:
 ```json
 {
   "last_pulled_time": "2026-04-10T16:07:14Z",
+  "offset": 123,
   "incidents": {
     "365f7220-34f6-11f1-bbc7-8fba9bac8610": "2026-04-10T16:07:14Z"
-  }
+  },
+  "open_state_sync_last_success_at": "2026-05-17T04:00:00.000Z",
+  "open_state_sync_next_due_at": "2026-05-17T04:15:30.000Z",
+  "open_state_sync_failure_count": 0
 }
 ```
 
@@ -114,7 +133,20 @@ Kafka messages keep the outer wrapper:
 }
 ```
 
-Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
+Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. The payload also includes activity enrichments under `data.lumu.activity_incident_details` and `data.lumu.endpoint_context`, with endpoint context sourced from managed event details and any concrete Defender contact/detail rows. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
+
+### Internal Pipeline
+
+The runtime is split into explicit stages:
+- journal updates are the primary hot path each cycle
+- open-state reconciliation is scheduled separately and persisted per tenant
+- tenant execution is scheduled with bounded concurrency and per-tenant jitter
+- `src/enrichment_fetcher.py`: fetches raw source data and applies source hierarchy/fallback policy
+- `src/incident_builder.py`: converts raw source data into one canonical `IncidentEvent`
+- `src/payload_serializer.py`: converts `IncidentEvent` into the published Kafka payload
+- `src/analyzer.py`: handles tenant-scoped state, event classification, and update extraction only
+
+This separation is intentional: fetch policy, data normalization, payload shape, and state tracking are tested independently.
 
 To re-process all incidents from the last 30 days, clear the state file:
 ```bash
@@ -132,6 +164,7 @@ The handler now logs:
 - A Kafka runtime config summary at startup.
 - Per-incident publish success/failure lines including `incident_uuid`.
 - A per-cycle summary with success and failure counts.
+- Defender budget pressure signals (minute/day usage) and any non-critical reconciliation skips when near daily cap.
 
 ## Development Setup (Local)
 

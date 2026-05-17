@@ -3,6 +3,8 @@ import httpx
 import logging
 import time
 import random
+import email.utils
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from .config import get_settings
 
@@ -19,19 +21,266 @@ class LumuSession:
         self._auth_lock = asyncio.Lock()
         self._last_request_time: float = 0.0
         self._rate_limit_lock = asyncio.Lock()
+        self._defender_budget_lock = asyncio.Lock()
         self.rate_limit_hits = 0
         self._min_request_interval = 2.0  # 2 seconds max globally
-        
-    async def _wait_for_rate_limit(self) -> None:
+        self._defender_budget_by_key: Dict[str, Dict[str, Any]] = {}
+        self._defender_max_items_unsupported_endpoints: set[str] = set()
+        self._defender_admission_lock = asyncio.Lock()
+        self._defender_next_allowed_global_at = 0.0
+        self._defender_next_allowed_by_endpoint: Dict[str, float] = {}
+        self._journal_next_allowed_by_company: Dict[str, float] = {}
+        self._defender_consecutive_429_by_endpoint: Dict[str, int] = {}
+        self._journal_breaker_state = "closed"
+        self._journal_breaker_open_until = 0.0
+        self._journal_breaker_next_probe_at = 0.0
+        self._journal_half_open_probe_in_flight = False
+
+    @staticmethod
+    def _now_monotonic() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def _is_journal_endpoint(endpoint_name: Optional[str]) -> bool:
+        return endpoint_name == "open_incidents_updates"
+
+    def _admission_endpoint_key(self, endpoint_name: Optional[str], company_key: Optional[str]) -> str:
+        endpoint = endpoint_name or "unknown_defender_endpoint"
+        if self._is_journal_endpoint(endpoint_name):
+            return f"{endpoint}:{self._normalize_company_key(company_key)}"
+        return endpoint
+
+    def _parse_retry_after_seconds(self, response: httpx.Response) -> float:
+        raw_retry_after = response.headers.get("Retry-After")
+        if not raw_retry_after:
+            return 0.0
+        raw_retry_after = raw_retry_after.strip()
+        if raw_retry_after.isdigit():
+            return max(0.0, float(raw_retry_after))
+        try:
+            dt = email.utils.parsedate_to_datetime(raw_retry_after)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (dt.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+    async def _admission_wait_and_reserve(self, endpoint_name: Optional[str], company_key: Optional[str] = None) -> None:
+        endpoint = endpoint_name or "unknown_defender_endpoint"
+        admission_key = self._admission_endpoint_key(endpoint_name, company_key)
+        while True:
+            sleep_for = 0.0
+            now = self._now_monotonic()
+            async with self._defender_admission_lock:
+                if self._is_journal_endpoint(endpoint):
+                    company = self._normalize_company_key(company_key)
+                    tenant_next_allowed = self._journal_next_allowed_by_company.get(company, 0.0)
+                    if now < tenant_next_allowed:
+                        raise RuntimeError("journal_tenant_cooldown")
+                    if self.settings.lumu_defender_journal_circuit_breaker_enabled:
+                        if self._journal_breaker_state == "open":
+                            if now < self._journal_breaker_open_until:
+                                raise RuntimeError("journal_circuit_open")
+                            self._journal_breaker_state = "half_open"
+                            self._journal_breaker_next_probe_at = now
+                            self._journal_half_open_probe_in_flight = False
+                            logger.info("Journal circuit breaker transition open->half_open")
+                        if self._journal_breaker_state == "half_open":
+                            if now < self._journal_breaker_next_probe_at:
+                                raise RuntimeError("journal_circuit_open")
+                            if self._journal_half_open_probe_in_flight:
+                                raise RuntimeError("journal_circuit_open")
+                            self._journal_half_open_probe_in_flight = True
+
+                global_wait = max(0.0, self._defender_next_allowed_global_at - now)
+                endpoint_next = self._defender_next_allowed_by_endpoint.get(admission_key, 0.0)
+                endpoint_wait = max(0.0, endpoint_next - now)
+                sleep_for = max(global_wait, endpoint_wait)
+                if sleep_for <= 0:
+                    global_min = float(self.settings.lumu_defender_global_min_interval_seconds)
+                    self._defender_next_allowed_global_at = now + global_min
+                    if self._is_journal_endpoint(endpoint):
+                        journal_min = float(self.settings.lumu_defender_journal_min_interval_seconds)
+                        self._defender_next_allowed_by_endpoint[admission_key] = max(
+                            self._defender_next_allowed_by_endpoint.get(admission_key, 0.0),
+                            now + journal_min,
+                        )
+                    return
+            logger.info("Defender admission wait endpoint=%s wait=%.2fs", endpoint, sleep_for)
+            await asyncio.sleep(sleep_for)
+
+    async def _register_defender_success(self, endpoint_name: Optional[str]) -> None:
+        endpoint = endpoint_name or "unknown_defender_endpoint"
+        async with self._defender_admission_lock:
+            self._defender_consecutive_429_by_endpoint[endpoint] = 0
+            if self._is_journal_endpoint(endpoint) and self._journal_breaker_state == "half_open":
+                self._journal_breaker_state = "closed"
+                self._journal_half_open_probe_in_flight = False
+                self._journal_breaker_next_probe_at = 0.0
+                logger.info("Journal circuit breaker transition half_open->closed")
+
+    async def _register_defender_429(self, endpoint_name: Optional[str], cooldown_seconds: float, company_key: Optional[str] = None) -> None:
+        endpoint = endpoint_name or "unknown_defender_endpoint"
+        admission_key = self._admission_endpoint_key(endpoint_name, company_key)
+        now = self._now_monotonic()
+        async with self._defender_admission_lock:
+            current = self._defender_consecutive_429_by_endpoint.get(admission_key, 0)
+            self._defender_consecutive_429_by_endpoint[admission_key] = current + 1
+            next_allowed = now + max(0.0, cooldown_seconds)
+            self._defender_next_allowed_by_endpoint[admission_key] = max(
+                self._defender_next_allowed_by_endpoint.get(admission_key, 0.0),
+                next_allowed,
+            )
+            if self._is_journal_endpoint(endpoint):
+                company = self._normalize_company_key(company_key)
+                self._journal_next_allowed_by_company[company] = max(
+                    self._journal_next_allowed_by_company.get(company, 0.0),
+                    next_allowed,
+                )
+                threshold = int(self.settings.lumu_defender_journal_circuit_breaker_threshold)
+                if self.settings.lumu_defender_journal_circuit_breaker_enabled and self._defender_consecutive_429_by_endpoint[admission_key] >= threshold:
+                    open_seconds = float(self.settings.lumu_defender_journal_circuit_breaker_open_seconds)
+                    self._journal_breaker_state = "open"
+                    self._journal_breaker_open_until = now + open_seconds
+                    self._journal_breaker_next_probe_at = self._journal_breaker_open_until
+                    self._journal_half_open_probe_in_flight = False
+                    logger.warning(
+                        "Journal circuit breaker transition to open consecutive_429=%s open_for=%.2fs",
+                        self._defender_consecutive_429_by_endpoint[admission_key],
+                        open_seconds,
+                    )
+                elif self._journal_breaker_state == "half_open":
+                    open_seconds = float(self.settings.lumu_defender_journal_circuit_breaker_open_seconds)
+                    self._journal_breaker_state = "open"
+                    self._journal_breaker_open_until = now + open_seconds
+                    self._journal_breaker_next_probe_at = self._journal_breaker_open_until
+                    self._journal_half_open_probe_in_flight = False
+                    logger.warning("Journal circuit breaker half_open probe failed; reopened for %.2fs", open_seconds)
+
+    def _is_defender_request(self, url: str) -> bool:
+        normalized = str(url or "").lower()
+        return normalized.startswith(self.settings.lumu_defender_url.lower())
+
+    @staticmethod
+    def _normalize_company_key(company_key: Optional[str]) -> str:
+        key = str(company_key or "").strip()
+        return key if key else "__unknown__"
+
+    def _extract_company_key_from_params(self, params: Optional[Dict[str, Any]]) -> str:
+        if not params:
+            return "__unknown__"
+        return self._normalize_company_key(params.get("key"))
+
+    def _get_defender_budget_state(self, company_key: str) -> Dict[str, Any]:
+        key = self._normalize_company_key(company_key)
+        state = self._defender_budget_by_key.get(key)
+        if state is None:
+            now = datetime.now(timezone.utc)
+            minute_start = now.replace(second=0, microsecond=0)
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            state = {
+                "minute_start": minute_start,
+                "minute_count": 0,
+                "day_start": day_start,
+                "day_count": 0,
+            }
+            self._defender_budget_by_key[key] = state
+        return state
+
+    @staticmethod
+    def _seconds_until_next_minute(now_utc: datetime) -> float:
+        next_minute = now_utc.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        return max(0.01, (next_minute - now_utc).total_seconds())
+
+    @staticmethod
+    def _seconds_until_next_utc_day(now_utc: datetime) -> float:
+        next_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return max(0.01, (next_day - now_utc).total_seconds())
+
+    def _refresh_defender_budget_windows(self, state: Dict[str, Any], now_utc: datetime) -> None:
+        minute_floor = now_utc.replace(second=0, microsecond=0)
+        day_floor = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        if state["minute_start"] != minute_floor:
+            state["minute_start"] = minute_floor
+            state["minute_count"] = 0
+        if state["day_start"] != day_floor:
+            state["day_start"] = day_floor
+            state["day_count"] = 0
+
+    async def _wait_for_defender_budget(self, company_key: str) -> None:
+        if not self.settings.lumu_defender_budget_enforce:
+            return
+        while True:
+            sleep_for = 0.0
+            async with self._defender_budget_lock:
+                state = self._get_defender_budget_state(company_key)
+                minute_limit = self.settings.lumu_defender_budget_minute_limit
+                day_limit = self.settings.lumu_defender_budget_day_limit
+                now_utc = datetime.now(timezone.utc)
+                self._refresh_defender_budget_windows(state, now_utc)
+                if state["minute_count"] < minute_limit and state["day_count"] < day_limit:
+                    state["minute_count"] += 1
+                    state["day_count"] += 1
+                    return
+
+                sleep_for = self._seconds_until_next_minute(now_utc)
+                if state["day_count"] >= day_limit:
+                    sleep_for = max(sleep_for, self._seconds_until_next_utc_day(now_utc))
+                logger.warning(
+                    "Defender request budget exhausted company_key=%s minute=%s/%s day=%s/%s sleeping=%.2fs",
+                    company_key,
+                    state["minute_count"],
+                    minute_limit,
+                    state["day_count"],
+                    day_limit,
+                    sleep_for,
+                )
+            await asyncio.sleep(sleep_for)
+
+    def is_defender_near_daily_cap(self, company_key: str, threshold: float = 0.85) -> bool:
+        normalized = self._normalize_company_key(company_key)
+        state = self._defender_budget_by_key.get(normalized)
+        if not state:
+            return False
+        now_utc = datetime.now(timezone.utc)
+        self._refresh_defender_budget_windows(state, now_utc)
+        day_limit = max(1, self.settings.lumu_defender_budget_day_limit)
+        return state["day_count"] >= int(day_limit * threshold)
+
+    def get_defender_budget_snapshot(self, company_key: str) -> Dict[str, int]:
+        state = self._get_defender_budget_state(company_key)
+        now_utc = datetime.now(timezone.utc)
+        self._refresh_defender_budget_windows(state, now_utc)
+        return {
+            "minute_count": int(state["minute_count"]),
+            "minute_limit": int(self.settings.lumu_defender_budget_minute_limit),
+            "day_count": int(state["day_count"]),
+            "day_limit": int(self.settings.lumu_defender_budget_day_limit),
+        }
+
+    def _maybe_attach_max_items(self, params: Optional[Dict[str, Any]], endpoint_name: str) -> Dict[str, Any]:
+        merged = dict(params or {})
+        if not self.settings.lumu_defender_use_max_items_param:
+            return merged
+        if endpoint_name in self._defender_max_items_unsupported_endpoints:
+            return merged
+        merged["max-items"] = self.settings.lumu_defender_max_items_param
+        return merged
+
+    async def _wait_for_rate_limit(self, url: str) -> None:
         """
         Enforce a global minimum interval between requests to prevent hitting 429 limits.
         """
         async with self._rate_limit_lock:
-            now = time.time()
-            elapsed = now - self._last_request_time
-            if elapsed < self._min_request_interval:
-                await asyncio.sleep(self._min_request_interval - elapsed)
-            self._last_request_time = time.time()
+            while True:
+                now = time.time()
+                sleep_for = max(0.0, self._min_request_interval - (now - self._last_request_time))
+                if sleep_for <= 0:
+                    break
+                await asyncio.sleep(sleep_for)
+
+            current_time = time.time()
+            self._last_request_time = current_time
 
     async def _ensure_authenticated(self) -> None:
         """
@@ -90,7 +339,9 @@ class LumuSession:
         params: Optional[Dict[str, Any]] = None, 
         json_data: Optional[Dict[str, Any]] = None,
         auth_required: bool = True,
-        _auth_retry_depth: int = 0
+        _auth_retry_depth: int = 0,
+        company_key: Optional[str] = None,
+        endpoint_name: Optional[str] = None,
     ) -> httpx.Response:
         """
         Generic request wrapper with exponential backoff and authentication handling.
@@ -104,11 +355,19 @@ class LumuSession:
 
         max_retries = self.settings.lumu_max_retries
         initial_backoff = self.settings.lumu_initial_backoff
+        if endpoint_name and params and endpoint_name in self._defender_max_items_unsupported_endpoints and "max-items" in params:
+            params = dict(params)
+            params.pop("max-items", None)
+        is_defender_request = self._is_defender_request(url)
 
         for attempt in range(max_retries + 1):
             try:
                 # Apply global rate limit throttle before executing any request
-                await self._wait_for_rate_limit()
+                await self._wait_for_rate_limit(url)
+                resolved_company_key = self._normalize_company_key(company_key) if company_key else self._extract_company_key_from_params(params)
+                if is_defender_request:
+                    await self._admission_wait_and_reserve(endpoint_name, resolved_company_key)
+                    await self._wait_for_defender_budget(resolved_company_key)
 
                 response = await self.client.request(
                     method=method, 
@@ -120,13 +379,46 @@ class LumuSession:
 
                 if response.status_code == 429:
                     self.rate_limit_hits += 1
+                    retry_after_seconds = self._parse_retry_after_seconds(response) if self.settings.lumu_defender_retry_respect_retry_after else 0.0
+                    default_cooldown = float(self.settings.lumu_defender_endpoint_cooldown_default_seconds)
+                    cooldown_seconds = max(default_cooldown, retry_after_seconds)
+                    if self._is_journal_endpoint(endpoint_name):
+                        cooldown_seconds = max(cooldown_seconds, float(self.settings.lumu_defender_journal_retry_after_floor_seconds))
+                    await self._register_defender_429(endpoint_name, cooldown_seconds, resolved_company_key)
+                    if self._is_journal_endpoint(endpoint_name):
+                        logger.warning(
+                            "Journal endpoint tenant placed in cooldown company_key=%s cooldown=%.2fs",
+                            resolved_company_key,
+                            cooldown_seconds,
+                        )
+                        raise RuntimeError("journal_tenant_cooldown")
                     if attempt == max_retries:
                         logger.error(f"Max retries reached for 429 error at {url}")
                         response.raise_for_status()
-                    
-                    backoff = initial_backoff * (2 ** attempt) + random.uniform(0, 0.5)
-                    logger.warning(f"Rate limited (429) for {url}. Retrying in {backoff:.2f}s (Attempt {attempt + 1}/{max_retries})")
+
+                    backoff = max(cooldown_seconds, initial_backoff * (2 ** attempt) + random.uniform(0, 0.5))
+                    logger.warning(
+                        "Rate limited (429) for %s. retry_after=%.2fs cooldown=%.2fs retry_in=%.2fs (Attempt %s/%s)",
+                        url,
+                        retry_after_seconds,
+                        cooldown_seconds,
+                        backoff,
+                        attempt + 1,
+                        max_retries,
+                    )
                     await asyncio.sleep(backoff)
+                    continue
+
+                if is_defender_request and response.status_code in (400, 422) and params and "max-items" in params and endpoint_name:
+                    self._defender_max_items_unsupported_endpoints.add(endpoint_name)
+                    params = dict(params)
+                    params.pop("max-items", None)
+                    logger.warning(
+                        "Defender endpoint does not support max-items endpoint=%s. Retrying without max-items.",
+                        endpoint_name,
+                    )
+                    if attempt == max_retries:
+                        response.raise_for_status()
                     continue
 
                 if response.status_code >= 500:
@@ -147,12 +439,30 @@ class LumuSession:
                     await self.authenticate()
                     headers["Authorization"] = self.bearer_token
                     # Direct recursion for 401 retry to avoid complex loop logic
-                    return await self._request_with_retry(method, url, headers, params, json_data, auth_required, _auth_retry_depth + 1)
+                    return await self._request_with_retry(
+                        method,
+                        url,
+                        headers,
+                        params,
+                        json_data,
+                        auth_required,
+                        _auth_retry_depth + 1,
+                        company_key=company_key,
+                        endpoint_name=endpoint_name,
+                    )
 
                 response.raise_for_status()
+                if is_defender_request:
+                    await self._register_defender_success(endpoint_name)
                 return response
             
             except (httpx.RequestError, httpx.TimeoutException) as e:
+                if is_defender_request:
+                    await self._register_defender_429(
+                        endpoint_name,
+                        float(self.settings.lumu_defender_endpoint_cooldown_default_seconds),
+                        company_key,
+                    )
                 if attempt == max_retries:
                     logger.error(f"Request failed after {max_retries} retries: {e}")
                     raise
@@ -237,10 +547,37 @@ class LumuSession:
             "items": items,
             "time": delay_time
         }
+        params = self._maybe_attach_max_items(params, endpoint_name="open_incidents_updates")
         
         logger.info(f"Fetching incident updates from offset {offset}...")
         # Note: auth_required=False because this API uses the 'key' query param
-        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
+        try:
+            response = await self._request_with_retry(
+                "GET",
+                url,
+                params=params,
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="open_incidents_updates",
+            )
+        except RuntimeError as exc:
+            if str(exc) in {"journal_circuit_open", "journal_tenant_cooldown"}:
+                reason = str(exc)
+                cooldown_seconds = self.get_journal_next_allowed_seconds(company_key) if reason == "journal_tenant_cooldown" else 0.0
+                logger.info(
+                    "Skipping Defender journal request due to rate guard reason=%s company_key=%s cooldown_remaining=%.2fs",
+                    reason,
+                    self._normalize_company_key(company_key),
+                    cooldown_seconds,
+                )
+                return {
+                    "updates": [],
+                    "offset": offset,
+                    "_rate_guard_skipped": True,
+                    "_rate_guard_reason": reason,
+                    "_rate_guard_cooldown_seconds": cooldown_seconds,
+                }
+            raise
         return response.json()
 
     async def get_all_incidents(self, company_key: str, from_date: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -251,7 +588,7 @@ class LumuSession:
         from datetime import datetime, timedelta, timezone
         
         url = f"{self.settings.lumu_defender_url}/api/incidents/all"
-        params = {"key": company_key}
+        params = self._maybe_attach_max_items({"key": company_key}, endpoint_name="all_incidents_history")
         
         all_items = []
         seen_ids = set()
@@ -307,7 +644,9 @@ class LumuSession:
                     url, 
                     params=params, 
                     json_data=payload,
-                    auth_required=False
+                    auth_required=False,
+                    company_key=company_key,
+                    endpoint_name="all_incidents_history",
                 )
                 
                 # If we hit the retention limit, the API returns a 400 error. Break gracefully.
@@ -356,7 +695,7 @@ class LumuSession:
         """
         from datetime import datetime, timezone
         url = f"{self.settings.lumu_defender_url}/api/incidents/all"
-        params = {"key": company_key}
+        params = self._maybe_attach_max_items({"key": company_key}, endpoint_name="open_incidents_state")
         
         all_open = []
         seen_ids = set()
@@ -381,7 +720,9 @@ class LumuSession:
                 url, 
                 params=params, 
                 json_data=payload,
-                auth_required=False
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="open_incidents_state",
             )
             
             if response.status_code != 200:
@@ -424,7 +765,14 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/details"
         params = {"key": company_key}
-        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
+        response = await self._request_with_retry(
+            "GET",
+            url,
+            params=params,
+            auth_required=False,
+            company_key=company_key,
+            endpoint_name="incident_details",
+        )
         return response.json()
 
     async def get_incident_contacts(self, company_key: str, incident_uuid: str) -> List[Dict[str, Any]]:
@@ -433,7 +781,14 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/contacts"
         params = {"key": company_key}
-        response = await self._request_with_retry("GET", url, params=params, auth_required=False)
+        response = await self._request_with_retry(
+            "GET",
+            url,
+            params=params,
+            auth_required=False,
+            company_key=company_key,
+            endpoint_name="incident_contacts",
+        )
         data = response.json()
         if isinstance(data, list):
             return data
@@ -473,6 +828,14 @@ class LumuSession:
         endpoint = f"/intelligence/companies/{company_id}/secops-incidents/{incident_uuid}/context/external-articles"
         return await self.get_with_auth(endpoint)
 
+    async def get_activity_event_details(self, company_uuid: str, event_uuid: str) -> Dict[str, Any]:
+        """
+        Fetch managed activity details for a specific activity event.
+        Endpoint: GET /data-api/companies/{company_uuid}/activity/incidents/{event_uuid}/details
+        """
+        endpoint = f"/data-api/companies/{company_uuid}/activity/incidents/{event_uuid}/details"
+        return await self.get_with_auth(endpoint)
+
     async def close(self):
         await self.client.aclose()
 
@@ -481,3 +844,7 @@ class LumuSession:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+    def get_journal_next_allowed_seconds(self, company_key: str) -> float:
+        company = self._normalize_company_key(company_key)
+        next_allowed = self._journal_next_allowed_by_company.get(company, 0.0)
+        return max(0.0, next_allowed - self._now_monotonic())

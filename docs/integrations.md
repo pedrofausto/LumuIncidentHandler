@@ -6,6 +6,12 @@ LumuIncidentHandler acts as an intelligent bridge between the Lumu platform and 
 
 The system communicates with three distinct Lumu API surfaces to build a complete forensic picture.
 
+The runtime applies a fixed source hierarchy:
+- Defender `details` for incident-level detail and actions
+- Managed `secops-incidents` for endpoint breadth and activity event references
+- Managed `activity/incidents/{event_uuid}/details` for per-endpoint telemetry/context
+- Defender `contacts` only as fallback when breadth or context is still incomplete
+
 ### 1. Authentication & STIX (Managed API)
 - **Base URL**: `https://managed.lumu.io`
 - **Authentication**: JWT Bearer token obtained via email/password sign-in.
@@ -14,12 +20,32 @@ The system communicates with three distinct Lumu API surfaces to build a complet
 ### 2. Incident Discovery (Defender API)
 - **Base URL**: `https://defender.lumu.io`
 - **Mechanism**: Authenticated via a `key` query parameter.
-- **Discovery**: Queries all active incidents. The system applies a 30-day sliding window for initial discovery and a high-water mark for subsequent polling cycles.
-- **Endpoint Data**: Retrieves specific details and contacts for impacted assets (hostnames, source IPs, and contact timestamps).
+- **Discovery**: Uses `GET /api/incidents/open-incidents/updates` as the primary hot path and runs `POST /api/incidents/all` only as scheduled open-state reconciliation or journal recovery.
+- **Tenant Execution Scheduling**: Polling cycles run tenants with bounded parallelism and per-tenant jitter to reduce synchronized request spikes against Defender APIs.
+- **Incident Details**: `GET /api/incidents/{incident_uuid}/details?key=...` is the primary incident-detail source.
+- **Contacts Fallback**: `GET /api/incidents/{incident_uuid}/contacts?key=...` is used only when Defender details plus Managed secops data do not provide enough endpoint breadth or endpoint context.
+- **Reconciliation Strategy**: Full open-incident sweeps are scheduled per tenant with persisted due times and exponential scheduler backoff after `/api/incidents/all` failures.
+- **Quota Governance**: Defender requests are budget-gated per tenant key using conservative limits (`35 req/min`, `8000 req/day`) derived from published Defender quotas (`50/min`, `10,000/day`).
+- **List Optimization**: Journal/state list endpoints can include `max-items`; if Defender rejects it (`400/422`) the handler disables that parameter for the endpoint for the remainder of the process and retries without it.
+- **Near-Daily-Cap Degradation**: When a tenant nears daily budget threshold, non-critical reconciliation sweeps are skipped and journal polling is automatically slowed/capped.
+- **Retry-After Cooldown Scheduler**: `429` responses are deferred using `Retry-After` as `next_allowed_at` cooldown, instead of immediate repeated retries.
+- **Tenant-Scoped Journal Cooldown**: cooldown for `open-incidents/updates` is keyed by tenant API key + endpoint, so one throttled tenant does not block others.
 
 ### 3. Context Enrichment (Defender API)
 - **Context Summary**: Fetches high-level summaries, MITRE ATT&CK technique mappings, and recommended playbooks.
 - **External Articles**: Retrieves curated intelligence articles from Lumu's researchers associated with the specific threat.
+
+### 4. Activity Enrichment (Managed API)
+- **SecOps Incident Summary**: Fetches incident-level managed summary data via `/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/details`.
+- **Activity Event Details**: Fetches per-event managed activity details via `/data-api/companies/{company_uuid}/activity/incidents/{event_uuid}/details`.
+- **Event ID Rule**: Activity detail requests use activity event IDs discovered inside the secops payload, not the secops incident ID itself.
+- **Endpoint Context Output**: Merges real per-endpoint context under `data.lumu.endpoint_context` using managed event details plus any concrete Defender contact/detail rows that carry source telemetry.
+
+### Internal Stages
+- **Fetcher**: `src/enrichment_fetcher.py`
+- **Builder**: `src/incident_builder.py`
+- **Serializer**: `src/payload_serializer.py`
+- **State / Event Classification**: `src/analyzer.py`
 
 ---
 
@@ -74,7 +100,15 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity,
       "tlp": "TLP: RED",
       "stix_indicators": [],
       "stix_malware": [],
-      "stix_sighting": null
+      "stix_sighting": null,
+      "activity_incident_details": {
+        "incident_id": "incident-uuid",
+        "counts": {},
+        "offenders_samples": [],
+        "targets_samples": [],
+        "first_event": {},
+        "last_event": {}
+      }
     }
   },
   "agent": {
@@ -100,6 +134,7 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity,
 ```
 
 Rule level mapping is `Low="3"`, `Medium="8"`, `High="16"`, with unknown values defaulting to `"8"`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; new incidents default to `NewIncidentCreated` when they are not already present in local state. When `EVENT_TYPE_TEST_MODE=true`, `data.lumu.event_type` is forced to `"test"` for debugging. The `integration`, top-level `severity`, top-level `event_type`, `ss_groups`, and `ss_customer` fields are not emitted.
+`data.lumu.endpoint_context` is emitted only when concrete per-endpoint context exists. Null-only placeholder entries are not emitted. `users` and `emails` are emitted only inside `endpoint_context` and are not duplicated into `affected_endpoints`. Telemetry severity is emitted only when it matches normalized incident severity.
 
 ---
 
@@ -122,6 +157,8 @@ All raw data is normalized into the `IncidentEvent` model.
 | | `data.lumu.extracted_iocs` | Context API | Extracted IOCs and parsed domains from summary enrichment. |
 | | `data.lumu.stix_indicators` | STIX Bundle | Patterns and IOCs from the STIX bundle. |
 | | `data.lumu.tlp` | STIX Bundle | Traffic Light Protocol level. |
+| **Activity Context** | `data.lumu.activity_incident_details` | Managed API | Per-incident managed secops summary including offender and target samples. |
+| | `data.lumu.endpoint_context` | Managed + Defender APIs | Per-endpoint users/emails/OS plus merged HTTP, network, and telemetry context from managed event details and concrete Defender contact/detail rows. |
 | **Response** | `data.lumu.recommended_playbooks`| Context API | Suggested SOPs for remediation. |
 | | `data.lumu.triggered_integrations`| Defender Details| Third-party tools already notified by Lumu. |
 | | `data.lumu.disseminated`| Defender Details| Whether an automated response action was observed. |

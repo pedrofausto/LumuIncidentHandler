@@ -1,16 +1,24 @@
-import asyncio
-import logging
-import sys
+﻿import asyncio
 import dataclasses
-import re
+import logging
+import random
 import socket
+import sys
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from .config import get_settings
-from .lumu_client import LumuSession
+from typing import Any, Dict, List
+
+import httpx
+
 from .analyzer import Analyzer
+from .config import get_settings
+from .enrichment_fetcher import fetch_incident_bundle
+from .incident_builder import build_incident_event
 from .kafka_client import KafkaClient
+from .lumu_client import LumuSession
+from .payload_serializer import normalize_customer_topic, serialize_incident_event
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -20,37 +28,6 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("lumu_monitor")
 
-MOVED_LUMU_FIELDS = {
-    "incident_uuid",
-    "title",
-    "adversaries",
-    "adversary_id",
-    "adversary_type",
-    "customer_uuid",
-    "customer_name",
-    "endpoints_affected",
-    "affected_endpoints",
-    "status",
-    "event_type",
-    "details",
-    "mitre_techniques",
-    "recommended_playbooks",
-    "intelligence_tags",
-    "intelligence_articles",
-    "disseminated",
-    "dissemination_time",
-    "dissemination_latency",
-    "mtt_response",
-    "mtt_resolution",
-    "triggered_integrations",
-    "tlp",
-    "related_artifacts",
-    "extracted_iocs",
-    "stix_indicators",
-    "stix_malware",
-    "stix_sighting",
-}
-
 
 @dataclasses.dataclass
 class TenantRuntime:
@@ -58,6 +35,20 @@ class TenantRuntime:
     tenant_name: str
     defender_api_key: str
     kafka_topic: str
+
+
+@dataclasses.dataclass
+class JournalSyncResult:
+    processed_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    offset_advanced: bool = False
+    offset_missing: bool = False
+    request_failed: bool = False
+    updates_seen: bool = False
+    skipped_by_rate_guard: bool = False
+    skip_reason: str | None = None
+    skip_cooldown_seconds: float = 0.0
 
 
 def get_agent_id() -> str:
@@ -86,34 +77,6 @@ def get_primary_host_ip() -> str:
         sock.close()
 
 
-def severity_to_rule_level(severity: str | None) -> str:
-    severity_map = {
-        "low": "3",
-        "medium": "8",
-        "high": "16",
-    }
-    return severity_map.get(str(severity or "").strip().lower(), "8")
-
-
-def normalize_customer_topic(customer_name: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]", "", (customer_name or "").lower())
-    return f"cli-{normalized}" if normalized else ""
-
-
-def _shape_affected_endpoint(endpoint: Dict[str, Any]) -> Dict[str, Any]:
-    srchost = endpoint.get("name") or endpoint.get("srchost") or endpoint.get("srcip") or ""
-    srcip = endpoint.get("srcip") or ""
-    shaped = {
-        "srchost": srchost,
-        "srcip": srcip,
-    }
-    if endpoint.get("first_contact"):
-        shaped["first_contact"] = endpoint["first_contact"]
-    if endpoint.get("last_contact"):
-        shaped["last_contact"] = endpoint["last_contact"]
-    return shaped
-
-
 def shape_kafka_payload(
     event_dict: Dict[str, Any],
     tenant_uuid: str,
@@ -123,122 +86,288 @@ def shape_kafka_payload(
     agent_id: str,
     agent_ip: str,
 ) -> Dict[str, Any]:
-    payload = {
-        key: value
-        for key, value in event_dict.items()
-        if key not in MOVED_LUMU_FIELDS and key not in {"integration", "severity"}
-    }
-
-    affected_endpoints = event_dict.get("affected_endpoints") or []
-    payload["data"] = {
-        "lumu": {
-            "id": event_dict.get("incident_uuid", ""),
-            "adversaries": event_dict.get("title", ""),
-            "adversary_id": event_dict.get("adversary_id", ""),
-            "adversary_types": event_dict.get("adversary_type", ""),
-            "company_id": event_dict.get("customer_uuid") or tenant_uuid,
-            "customer_name": event_dict.get("customer_name") or tenant_name,
-            "endpoints_affected": event_dict.get("endpoints_affected", 0),
-            "affected_endpoints": [
-                _shape_affected_endpoint(endpoint)
-                for endpoint in affected_endpoints
-                if isinstance(endpoint, dict)
-            ],
-            "status": event_dict.get("status", ""),
-            "event_type": (
-                "test"
-                if settings.event_type_test_mode
-                else (event_dict.get("event_type") or "NewIncidentCreated")
-            ),
-            "details": event_dict.get("details", ""),
-            "mitre_techniques": event_dict.get("mitre_techniques", []),
-            "related_artifacts": event_dict.get("related_artifacts", {}),
-            "recommended_playbooks": event_dict.get("recommended_playbooks", []),
-            "intelligence_tags": event_dict.get("intelligence_tags", []),
-            "intelligence_articles": event_dict.get("intelligence_articles", []),
-            "extracted_iocs": event_dict.get("extracted_iocs", []),
-            "disseminated": event_dict.get("disseminated", False),
-            "dissemination_time": event_dict.get("dissemination_time"),
-            "dissemination_latency": event_dict.get("dissemination_latency"),
-            "mtt_response": event_dict.get("mtt_response"),
-            "mtt_resolution": event_dict.get("mtt_resolution"),
-            "triggered_integrations": event_dict.get("triggered_integrations", []),
-            "tlp": event_dict.get("tlp", "TLP: RED"),
-            "stix_indicators": event_dict.get("stix_indicators", []),
-            "stix_malware": event_dict.get("stix_malware", []),
-            "stix_sighting": event_dict.get("stix_sighting"),
-        }
-    }
-    payload["agent"] = {
-        "name": hostname,
-        "id": agent_id,
-        "ip": agent_ip,
-    }
-    payload["rule"] = {
-        "level": severity_to_rule_level(event_dict.get("severity")),
-        "id": "0000",
-        "groups": ["lumu"],
-        "description": "Lumu integration rule",
-    }
-    payload["decoder"] = {
-        "name": "int-dec-lumu",
-    }
-    payload["manager"] = {
-        "name": hostname,
-    }
-    payload["product_name"] = "Lumu Defender"
-    payload["timezone"] = settings.payload_timezone
-    return payload
+    return serialize_incident_event(
+        event_dict=event_dict,
+        tenant_uuid=tenant_uuid,
+        tenant_name=tenant_name,
+        settings=settings,
+        hostname=hostname,
+        agent_id=agent_id,
+        agent_ip=agent_ip,
+    )
 
 
-async def _safe_enrichment(label: str, incident_uuid: str, operation, default):
+async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False):
+    return await fetch_incident_bundle(
+        client=client,
+        tenant_uuid=tenant_uuid,
+        defender_key=company_key,
+        incident_uuid=inc_uuid,
+        is_bootstrap_mode=is_bootstrap_mode,
+    )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_429_http_error(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code == 429
+
+
+def _compute_tenant_cycle_jitter_seconds(max_seconds: int) -> float:
+    if max_seconds <= 0:
+        return 0.0
+    return random.uniform(0.0, float(max_seconds))
+
+
+async def run_journal_sync(
+    client: LumuSession,
+    analyzer: Analyzer,
+    kafka: KafkaClient,
+    tenant_uuid: str,
+    tenant_name: str,
+    company_key: str,
+    kafka_topic: str,
+) -> JournalSyncResult:
+    result = JournalSyncResult()
+    settings = get_settings()
+    items_per_page = settings.lumu_journal_items_per_page
+    max_items_per_page = settings.lumu_journal_items_per_page
+    delay_time_seconds = settings.lumu_journal_delay_time_seconds
+    max_pages_per_cycle = settings.lumu_journal_max_pages_per_cycle
+    if getattr(client, "is_defender_near_daily_cap", None) and client.is_defender_near_daily_cap(company_key, threshold=0.85):
+        delay_time_seconds = max(delay_time_seconds, 30)
+        max_pages_per_cycle = min(max_pages_per_cycle, 1)
+        if getattr(client, "get_defender_budget_snapshot", None):
+            budget = client.get_defender_budget_snapshot(company_key)
+            logger.warning(
+                "Near Defender daily cap in journal mode tenant=%s minute=%s/%s day=%s/%s using_delay=%ss pages_cap=%s",
+                tenant_uuid,
+                budget["minute_count"],
+                budget["minute_limit"],
+                budget["day_count"],
+                budget["day_limit"],
+                delay_time_seconds,
+                max_pages_per_cycle,
+            )
+    pages_processed = 0
+
+    while pages_processed < max_pages_per_cycle:
+        previous_offset = analyzer.offset
+        pre_batch_hits = client.rate_limit_hits
+        current_items_per_page = items_per_page
+        try:
+            updates_data = await client.get_incident_updates(
+                company_key,
+                offset=analyzer.offset,
+                items=current_items_per_page,
+                delay_time=delay_time_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Journal sync request failed tenant=%s tenant_name=%s offset=%s reason=%s",
+                tenant_uuid,
+                tenant_name,
+                previous_offset,
+                exc,
+            )
+            result.request_failed = True
+            break
+        pages_processed += 1
+
+        updates_list = updates_data.get("updates", [])
+        new_offset = updates_data.get("offset")
+        if updates_data.get("_rate_guard_skipped"):
+            result.skipped_by_rate_guard = True
+            result.skip_reason = updates_data.get("_rate_guard_reason") or "rate_guard_skip"
+            result.skip_cooldown_seconds = float(updates_data.get("_rate_guard_cooldown_seconds") or 0.0)
+            logger.info(
+                "Journal polling skipped by rate guard tenant=%s reason=%s cooldown_remaining=%.2fs",
+                tenant_uuid,
+                result.skip_reason,
+                result.skip_cooldown_seconds,
+            )
+            break
+
+        if not updates_list:
+            logger.info("No new incident journal updates for tenant '%s'.", tenant_name)
+            if new_offset is not None:
+                if new_offset != previous_offset:
+                    result.offset_advanced = True
+                analyzer.offset = new_offset
+                analyzer._save_state()
+            else:
+                result.offset_missing = True
+                logger.warning(
+                    "Journal updates returned no offset tenant=%s previous_offset=%s; stopping cycle",
+                    tenant_uuid,
+                    previous_offset,
+                )
+            break
+
+        result.updates_seen = True
+        logger.info("Retrieved %s journal update event(s). Processing...", len(updates_list))
+
+        is_bootstrap_mode = len(updates_list) >= current_items_per_page
+        if is_bootstrap_mode:
+            logger.debug("High backlog detected (>= %s updates). Deep enrichments will be skipped.", current_items_per_page)
+
+        raw_incidents = analyzer.extract_incidents_from_updates(updates_list)
+        result.processed_count += len(raw_incidents)
+
+        if raw_incidents:
+            success, failed = await process_and_send_batch(
+                client,
+                analyzer,
+                kafka,
+                raw_incidents,
+                tenant_uuid,
+                tenant_name,
+                company_key,
+                kafka_topic,
+                is_bootstrap_mode=is_bootstrap_mode,
+            )
+            result.success_count += success
+            result.failure_count += failed
+        else:
+            logger.info("No incident-related updates in this journal batch.")
+
+        if new_offset is None:
+            result.offset_missing = True
+            logger.warning(
+                "Journal updates returned null offset tenant=%s previous_offset=%s; stopping cycle",
+                tenant_uuid,
+                previous_offset,
+            )
+            break
+
+        if new_offset == previous_offset:
+            logger.warning(
+                "Journal offset did not advance tenant=%s offset=%s; stopping cycle to prevent infinite loop",
+                tenant_uuid,
+                previous_offset,
+            )
+            break
+
+        result.offset_advanced = True
+        analyzer.offset = new_offset
+        analyzer._save_state()
+
+        post_batch_hits = client.rate_limit_hits
+        if post_batch_hits > pre_batch_hits:
+            items_per_page = max(5, int(current_items_per_page / 2))
+            logger.warning("Rate-limit pressure detected. Shrinking batch size to %s.", items_per_page)
+        else:
+            items_per_page = min(max_items_per_page, current_items_per_page + 5)
+
+        if len(updates_list) < current_items_per_page:
+            break
+
+    if pages_processed >= max_pages_per_cycle:
+        logger.info(
+            "Journal page cap reached tenant=%s pages=%s max_pages_per_cycle=%s",
+            tenant_uuid,
+            pages_processed,
+            max_pages_per_cycle,
+        )
+
+    return result
+
+
+def should_run_open_state_reconciliation(analyzer: Analyzer, journal_result: JournalSyncResult, now_utc: datetime, settings) -> tuple[bool, str]:
+    if journal_result.skipped_by_rate_guard:
+        return True, journal_result.skip_reason or "journal_rate_guard_skip"
+    if journal_result.request_failed:
+        return True, "journal_request_failed"
+    if journal_result.offset_missing:
+        return True, "journal_offset_missing"
+    if journal_result.updates_seen and not journal_result.offset_advanced:
+        return True, "journal_offset_stalled"
+    if settings.lumu_open_state_sync_on_startup and not analyzer.open_state_sync_last_success_at:
+        return True, "startup"
+    if analyzer.force_offset_reset_applied:
+        return True, "periodic_due"
+    if analyzer.is_open_state_sync_due(now_utc):
+        return True, "periodic_due"
+    return False, "not_due"
+
+
+async def run_open_state_reconciliation(
+    client: LumuSession,
+    analyzer: Analyzer,
+    kafka: KafkaClient,
+    tenant_uuid: str,
+    tenant_name: str,
+    company_key: str,
+    kafka_topic: str,
+    reason: str,
+) -> tuple[int, int]:
+    settings = get_settings()
+    now_utc = _utc_now()
+    logger.info(
+        "Starting open-state reconciliation tenant=%s tenant_name=%s reason=%s",
+        tenant_uuid,
+        tenant_name,
+        reason,
+    )
     try:
-        return await operation
+        open_incidents = await client.get_open_incidents(company_key, from_date=None)
+        to_enrich_state = [inc for inc in open_incidents if analyzer.should_process_incident(inc)]
+
+        if to_enrich_state:
+            logger.info("Detected %s new or updated open incident(s) during reconciliation.", len(to_enrich_state))
+            success, failed = await process_and_send_batch(
+                client,
+                analyzer,
+                kafka,
+                raw_incidents=to_enrich_state,
+                tenant_uuid=tenant_uuid,
+                tenant_name=tenant_name,
+                company_key=company_key,
+                kafka_topic=kafka_topic,
+                is_bootstrap_mode=False,
+            )
+        else:
+            logger.info("Open-state reconciliation found no changed incidents for tenant '%s'.", tenant_name)
+            success, failed = 0, 0
+
+        analyzer.mark_open_state_sync_success(
+            now_utc=now_utc,
+            interval_minutes=settings.lumu_open_state_reconciliation_minutes,
+            jitter_seconds=settings.lumu_open_state_jitter_seconds,
+        )
+        logger.info(
+            "Open-state reconciliation succeeded tenant=%s next_due=%s",
+            tenant_uuid,
+            analyzer.open_state_sync_next_due_at or "unscheduled",
+        )
+        return success, failed
     except Exception as exc:
-        logger.warning("%s enrichment failed for incident %s: %s", label, incident_uuid, exc)
-        return default
+        analyzer.mark_open_state_sync_failure(
+            now_utc=now_utc,
+            base_backoff_minutes=settings.lumu_open_state_failure_backoff_minutes,
+            max_backoff_minutes=settings.lumu_open_state_max_backoff_minutes,
+        )
+        if _is_429_http_error(exc):
+            logger.warning(
+                "Open-state reconciliation rate limited tenant=%s tenant_name=%s reason=%s next_due=%s",
+                tenant_uuid,
+                tenant_name,
+                reason,
+                analyzer.open_state_sync_next_due_at or "unscheduled",
+            )
+        else:
+            logger.warning(
+                "Open-state reconciliation failed tenant=%s tenant_name=%s reason=%s next_due=%s error=%s",
+                tenant_uuid,
+                tenant_name,
+                reason,
+                analyzer.open_state_sync_next_due_at or "unscheduled",
+                exc,
+            )
+        return 0, 0
 
-async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False) -> Dict[str, Any]:
-    """
-    Fetches STIX, details, contacts, summary context, and external-articles context for a single incident.
-    """
-    try:
-        details_task = client.get_incident_details(company_key, inc_uuid)
-        contacts_task = client.get_incident_contacts(company_key, inc_uuid)
-        stix_task = client.get_incident_stix(tenant_uuid, inc_uuid)
-        summary_task = client.get_incident_context_summary(tenant_uuid, inc_uuid)
-        
-        # External Articles are the heaviest/slowest, we only skip THESE in bootstrap mode
-        articles_task = None
-        if not is_bootstrap_mode:
-            articles_task = client.get_incident_external_articles(tenant_uuid, inc_uuid)
-        
-        # Batch fetching with small delays to respect rate limits
-        stix = await _safe_enrichment("STIX", inc_uuid, stix_task, {})
-        await asyncio.sleep(0.5)
-        details = await _safe_enrichment("details", inc_uuid, details_task, {})
-        await asyncio.sleep(0.5)
-        contacts = await _safe_enrichment("contacts", inc_uuid, contacts_task, [])
-        await asyncio.sleep(0.5)
-        summary = await _safe_enrichment("summary", inc_uuid, summary_task, {})
-        
-        articles = []
-        if articles_task:
-            await asyncio.sleep(0.5)
-            articles = await _safe_enrichment("external articles", inc_uuid, articles_task, [])
-        
-        # Gracefully handle exceptions when specific APIs return 404 or fail
-        return {
-            'uuid': inc_uuid, 
-            'stix': stix if not isinstance(stix, Exception) else {}, 
-            'details': details if not isinstance(details, Exception) else {},
-            'contacts': contacts if not isinstance(contacts, Exception) else [],
-            'summary': summary if not isinstance(summary, Exception) else {},
-            'articles': articles if not isinstance(articles, Exception) else []
-        }
-    except Exception as e:
-        logger.debug(f"Intelligence enrichment failed for incident {inc_uuid}: {e}")
-        return {'uuid': inc_uuid, 'stix': {}, 'details': {}, 'contacts': [], 'summary': {}, 'articles': []}
 
 async def monitor_tenant(
     client: LumuSession,
@@ -250,135 +379,92 @@ async def monitor_tenant(
     kafka_topic: str,
 ):
     """
-    Monitors a single tenant for security incidents using a Hybrid Strategy:
-    1. State Sync: Fetch all currently OPEN incidents.
-    2. Incremental Sync: Fetch journal UPDATES via offset.
+    Monitors a single tenant using a journal-first strategy with scheduled open-state reconciliation.
     """
-    logger.info(f"Scanning security incidents for tenant '{tenant_name}' ({tenant_uuid})...")
+    logger.info("Scanning security incidents for tenant '%s' (%s)...", tenant_name, tenant_uuid)
     publish_success_count = 0
     publish_failure_count = 0
+    reconciliation_reason = "not_due"
     try:
         if not company_key:
-            logger.warning(f"LUMU_DEFENDER_KEY is not set. Skipping incident scan.")
+            logger.warning("LUMU_DEFENDER_KEY is not set. Skipping incident scan.")
             return
 
-        # --- 1. State Sync: Fetch and process recently OPEN incidents ---
-        logger.info(f"Initializing State Sync for open incidents (since {analyzer.last_pulled_time})...")
-        open_incidents = await client.get_open_incidents(company_key, from_date=analyzer.last_pulled_time)
-        
-        # Filter to only enriched those that actually changed
-        to_enrich_state = [inc for inc in open_incidents if analyzer.should_process_incident(inc)]
-        
-        if to_enrich_state:
-            logger.info(f"Detected {len(to_enrich_state)} new or updated open incident(s) in state sync.")
-            # Reuse the enrichment and sending logic
-            success, failed = await process_and_send_batch(
-                client, analyzer, kafka,
-                raw_incidents=to_enrich_state, 
-                tenant_uuid=tenant_uuid, 
-                tenant_name=tenant_name, 
+        journal_result = await run_journal_sync(
+            client=client,
+            analyzer=analyzer,
+            kafka=kafka,
+            tenant_uuid=tenant_uuid,
+            tenant_name=tenant_name,
+            company_key=company_key,
+            kafka_topic=kafka_topic,
+        )
+        publish_success_count += journal_result.success_count
+        publish_failure_count += journal_result.failure_count
+
+        now_utc = _utc_now()
+        should_reconcile, reconciliation_reason = should_run_open_state_reconciliation(
+            analyzer=analyzer,
+            journal_result=journal_result,
+            now_utc=now_utc,
+            settings=get_settings(),
+        )
+
+        if should_reconcile and reconciliation_reason in {"startup", "periodic_due"}:
+            if client.is_defender_near_daily_cap(company_key, threshold=0.85):
+                budget = client.get_defender_budget_snapshot(company_key)
+                should_reconcile = False
+                reconciliation_reason = "budget_degraded"
+                logger.warning(
+                    "Skipping non-critical reconciliation due to Defender daily budget pressure tenant=%s minute=%s/%s day=%s/%s",
+                    tenant_uuid,
+                    budget["minute_count"],
+                    budget["minute_limit"],
+                    budget["day_count"],
+                    budget["day_limit"],
+                )
+
+        if should_reconcile:
+            success, failed = await run_open_state_reconciliation(
+                client=client,
+                analyzer=analyzer,
+                kafka=kafka,
+                tenant_uuid=tenant_uuid,
+                tenant_name=tenant_name,
                 company_key=company_key,
                 kafka_topic=kafka_topic,
-                is_bootstrap_mode=False # State sync is usually light enough
+                reason=reconciliation_reason,
             )
             publish_success_count += success
             publish_failure_count += failed
         else:
-            logger.info("Universal state sync: All open incidents are already up-to-date.")
-
-        # --- 2. Incremental Sync: Process Update Journal via Offset ---
-        items_per_page = 50
-        while True:
-            previous_offset = analyzer.offset
-            pre_batch_hits = client.rate_limit_hits
-            updates_data = await client.get_incident_updates(company_key, offset=analyzer.offset, items=items_per_page)
-            updates_list = updates_data.get("updates", [])
-            new_offset = updates_data.get("offset")
-            
-            if not updates_list:
-                logger.info(f"No new incident journal updates for tenant '{tenant_name}'.")
-                if new_offset is not None:
-                    analyzer.offset = new_offset
-                    analyzer._save_state()
-                else:
-                    logger.warning(
-                        "Journal updates returned no offset tenant=%s previous_offset=%s; stopping cycle",
-                        tenant_uuid,
-                        previous_offset,
-                    )
-                break
-
-            logger.info(f"Retrieved {len(updates_list)} journal update event(s). Processing...")
-            
-            # Detect Bootstrap / Backlog mode
-            is_bootstrap_mode = len(updates_list) >= items_per_page
-            if is_bootstrap_mode:
-                logger.debug(f"High backlog detected (>= {items_per_page} updates). Deep enrichments will be skipped.")
-
-            raw_incidents = analyzer.extract_incidents_from_updates(updates_list)
-
-            if raw_incidents:
-                success, failed = await process_and_send_batch(
-                    client, analyzer, kafka,
-                    raw_incidents, 
-                    tenant_uuid, 
-                    tenant_name, 
-                    company_key, 
-                    kafka_topic,
-                    is_bootstrap_mode=is_bootstrap_mode
-                )
-                publish_success_count += success
-                publish_failure_count += failed
-            else:
-                logger.info("No incident-related updates in this journal batch.")
-
-            # Advance Offset and Persist State
-            if new_offset is None:
-                logger.warning(
-                    "Journal updates returned null offset tenant=%s previous_offset=%s; stopping cycle",
-                    tenant_uuid,
-                    previous_offset,
-                )
-                break
-            if new_offset == previous_offset:
-                logger.warning(
-                    "Journal offset did not advance tenant=%s offset=%s; stopping cycle to prevent infinite loop",
-                    tenant_uuid,
-                    previous_offset,
-                )
-                break
-
-            analyzer.offset = new_offset
-            analyzer._save_state()
-            
-            # 5. Evaluate AIMD for next batch
-            post_batch_hits = client.rate_limit_hits
-            if post_batch_hits > pre_batch_hits:
-                items_per_page = max(5, int(items_per_page / 2))
-                logger.warning(f"Rate-limit pressure detected. Shrinking batch size to {items_per_page}.")
-            else:
-                items_per_page = min(50, items_per_page + 5)
-            
-            if len(updates_list) < items_per_page:
-                break
+            logger.info(
+                "Skipping open-state reconciliation tenant=%s next_due=%s",
+                tenant_uuid,
+                analyzer.open_state_sync_next_due_at or "unscheduled",
+            )
 
     except Exception as e:
         logger.error(f"Error processing incidents for tenant {tenant_uuid}: {str(e)}")
     finally:
         logger.info(
-            "Cycle publish summary tenant=%s success=%s failed=%s",
+            "Cycle publish summary tenant=%s success=%s failed=%s journal_processed=%s reconciliation=%s next_due=%s",
             tenant_uuid,
             publish_success_count,
             publish_failure_count,
+            journal_result.processed_count if 'journal_result' in locals() else 0,
+            reconciliation_reason,
+            analyzer.open_state_sync_next_due_at or "unscheduled",
         )
 
+
 async def process_and_send_batch(
-    client: LumuSession, 
-    analyzer: Analyzer, 
+    client: LumuSession,
+    analyzer: Analyzer,
     kafka: KafkaClient,
-    raw_incidents: List[Dict[str, Any]], 
-    tenant_uuid: str, 
-    tenant_name: str, 
+    raw_incidents: List[Dict[str, Any]],
+    tenant_uuid: str,
+    tenant_name: str,
     company_key: str,
     kafka_topic: str,
     is_bootstrap_mode: bool = False
@@ -391,7 +477,6 @@ async def process_and_send_batch(
     agent_id = get_agent_id()
     agent_ip = get_primary_host_ip()
 
-    # 1. Map UUIDs to raw objects for reconstruction after streaming
     uuid_to_raw = {}
     for inc in raw_incidents:
         uid = inc.get('uuid') or inc.get('id')
@@ -401,49 +486,51 @@ async def process_and_send_batch(
     if not uuid_to_raw:
         return (0, 0)
 
-    # 2. Enrichment with Semaphore
     semaphore = asyncio.Semaphore(2)
-    
+
     async def sem_enrich(inc_uuid):
         async with semaphore:
-            result = await enrich_incident(client, tenant_uuid, company_key, inc_uuid, is_bootstrap_mode)
+            result = await fetch_incident_bundle(
+                client=client,
+                tenant_uuid=tenant_uuid,
+                defender_key=company_key,
+                incident_uuid=inc_uuid,
+                is_bootstrap_mode=is_bootstrap_mode,
+            )
             await asyncio.sleep(1.0)
             return result
 
     unique_uuids = list(uuid_to_raw.keys())
     tasks = [sem_enrich(uuid) for uuid in unique_uuids]
-    
-    # 3. Stream Results: Process each as it completes
+
     logger.info(f"Enriching and streaming {len(unique_uuids)} incident(s) for '{tenant_name}'...")
     success_count = 0
     failure_count = 0
-    
+
     for finished_task in asyncio.as_completed(tasks):
         try:
-            res = await finished_task
-            inc_uuid = res.get('uuid')
+            bundle = await finished_task
+            inc_uuid = bundle.incident_uuid
             raw_inc = uuid_to_raw.get(inc_uuid)
-            
+
             if not raw_inc:
                 continue
 
-            # Map the single incident
-            mapped_events = analyzer.evaluate_incidents(
-                [raw_inc],
-                stix_data_map={inc_uuid: res['stix']},
-                details_map={inc_uuid: res['details']},
-                contacts_map={inc_uuid: res.get('contacts', [])},
-                summary_map={inc_uuid: res['summary']},
-                articles_map={inc_uuid: res['articles']}
-            )
+            event_type = analyzer.classify_incident_event_type(raw_inc)
+            mapped_events = [
+                build_incident_event(
+                    raw_incident=raw_inc,
+                    bundle=bundle,
+                    event_type=event_type,
+                )
+            ]
 
-            # Send to Kafka
             for event in mapped_events:
                 try:
                     event_dict = dataclasses.asdict(event)
                     event_dict["customer_name"] = tenant_name
                     event_dict["customer_uuid"] = tenant_uuid
-                    event_dict = shape_kafka_payload(
+                    event_dict = serialize_incident_event(
                         event_dict=event_dict,
                         tenant_uuid=tenant_uuid,
                         tenant_name=tenant_name,
@@ -452,7 +539,7 @@ async def process_and_send_batch(
                         agent_id=agent_id,
                         agent_ip=agent_ip,
                     )
-                    
+
                     await kafka.send_incident(event_dict, topic=kafka_topic)
                     success_count += 1
                     logger.info(
@@ -462,8 +549,7 @@ async def process_and_send_batch(
                         event.incident_uuid,
                         kafka_topic,
                     )
-                    
-                    # Update state immediately
+
                     analyzer.update_incident_time(event.incident_uuid, event.last_contact)
                 except Exception as e:
                     failure_count += 1
@@ -480,18 +566,90 @@ async def process_and_send_batch(
             failure_count += 1
     return (success_count, failure_count)
 
+
+async def run_tenant_batch(
+    client: LumuSession,
+    kafka: KafkaClient,
+    analyzers_by_tenant: Dict[str, Analyzer],
+    tenant_registry: Dict[str, TenantRuntime],
+    settings,
+) -> None:
+    semaphore = asyncio.Semaphore(settings.lumu_tenant_concurrency_cap)
+    runtime_items = list(tenant_registry.items())
+
+    async def run_tenant_with_cap(runtime: TenantRuntime) -> None:
+        jitter_seconds = _compute_tenant_cycle_jitter_seconds(settings.lumu_tenant_cycle_jitter_max_seconds)
+        logger.debug(
+            "Tenant queued tenant_uuid=%s tenant_name=%s jitter=%.2fs",
+            runtime.tenant_uuid,
+            runtime.tenant_name,
+            jitter_seconds,
+        )
+        async with semaphore:
+            started = time.monotonic()
+            logger.debug(
+                "Tenant slot acquired tenant_uuid=%s tenant_name=%s",
+                runtime.tenant_uuid,
+                runtime.tenant_name,
+            )
+            if jitter_seconds > 0:
+                await asyncio.sleep(jitter_seconds)
+            analyzer = analyzers_by_tenant.setdefault(runtime.tenant_uuid, Analyzer(state_file_key=runtime.tenant_uuid))
+            await monitor_tenant(
+                client=client,
+                analyzer=analyzer,
+                kafka=kafka,
+                tenant_uuid=runtime.tenant_uuid,
+                tenant_name=runtime.tenant_name,
+                company_key=runtime.defender_api_key,
+                kafka_topic=runtime.kafka_topic,
+            )
+            elapsed = time.monotonic() - started
+            logger.debug(
+                "Tenant slot released tenant_uuid=%s tenant_name=%s elapsed=%.2fs",
+                runtime.tenant_uuid,
+                runtime.tenant_name,
+                elapsed,
+            )
+
+    tasks = [asyncio.create_task(run_tenant_with_cap(runtime)) for _tenant_uuid, runtime in runtime_items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for (tenant_uuid, runtime), result in zip(runtime_items, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Tenant cycle failed tenant_uuid=%s tenant_name=%s reason=%s",
+                tenant_uuid,
+                runtime.tenant_name,
+                result,
+            )
+
+
 async def run_loop():
     settings = get_settings()
     interval_seconds = settings.polling_interval_minutes * 60
     analyzers_by_tenant: Dict[str, Analyzer] = {}
     tenant_registry: Dict[str, TenantRuntime] = {}
 
-    logger.info(f"Lumu Incident Handler started.")
+    logger.info("Lumu Incident Handler started.")
     logger.info(
         "Kafka runtime config bootstrap=%s delivery_timeout=%ss flush_timeout=%ss",
         settings.kafka_bootstrap_servers,
         settings.kafka_delivery_timeout_seconds,
         settings.kafka_flush_timeout_seconds,
+    )
+    logger.info(
+        "Defender budget config enforce=%s minute_limit=%s day_limit=%s journal_items=%s journal_delay=%ss journal_pages_cap=%s",
+        settings.lumu_defender_budget_enforce,
+        settings.lumu_defender_budget_minute_limit,
+        settings.lumu_defender_budget_day_limit,
+        settings.lumu_journal_items_per_page,
+        settings.lumu_journal_delay_time_seconds,
+        settings.lumu_journal_max_pages_per_cycle,
+    )
+    logger.info(
+        "Tenant scheduler config concurrency_cap=%s cycle_jitter_max_seconds=%s",
+        settings.lumu_tenant_concurrency_cap,
+        settings.lumu_tenant_cycle_jitter_max_seconds,
     )
 
     try:
@@ -595,17 +753,13 @@ async def run_loop():
                 logger.info("--- Starting Incident Polling Cycle ---")
                 try:
                     await refresh_tenant_registry(force_full=False)
-                    for tenant_uuid, runtime in list(tenant_registry.items()):
-                        analyzer = analyzers_by_tenant.setdefault(tenant_uuid, Analyzer(state_file_key=tenant_uuid))
-                        await monitor_tenant(
-                            client=client,
-                            analyzer=analyzer,
-                            kafka=kafka,
-                            tenant_uuid=runtime.tenant_uuid,
-                            tenant_name=runtime.tenant_name,
-                            company_key=runtime.defender_api_key,
-                            kafka_topic=runtime.kafka_topic,
-                        )
+                    await run_tenant_batch(
+                        client=client,
+                        kafka=kafka,
+                        analyzers_by_tenant=analyzers_by_tenant,
+                        tenant_registry=tenant_registry,
+                        settings=settings,
+                    )
                 except Exception as e:
                     logger.error(f"Critical error during polling cycle: {str(e)}")
 
@@ -614,7 +768,6 @@ async def run_loop():
 
     except asyncio.CancelledError:
         logger.info("Monitor interrupted. Shutting down gracefully...")
-
 
 
 if __name__ == "__main__":

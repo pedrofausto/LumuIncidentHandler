@@ -1,4 +1,4 @@
-from functools import lru_cache
+﻿from functools import lru_cache
 from typing import Optional
 
 from pydantic import EmailStr, Field, SecretStr, field_validator
@@ -35,6 +35,30 @@ class Settings(BaseSettings):
     lumu_initial_time: str = Field("2026-04-14T00:00:00Z", description="Initial fromDate timestamp for open incidents sync")
     lumu_force_offset: bool = Field(False, description="If True, overrides the persisted state offset with lumu_initial_offset.")
     verify_ssl: bool = Field(True, description="Enable or disable SSL verification for all API clients")
+    lumu_open_state_reconciliation_minutes: int = Field(15, description="How often to run a full open-incidents reconciliation sweep per tenant")
+    lumu_open_state_jitter_seconds: int = Field(120, description="Jitter applied to per-tenant open-state reconciliation scheduling")
+    lumu_open_state_failure_backoff_minutes: int = Field(30, description="Base backoff in minutes after a failed open-state reconciliation")
+    lumu_open_state_max_backoff_minutes: int = Field(360, description="Maximum backoff in minutes after repeated reconciliation failures")
+    lumu_open_state_sync_on_startup: bool = Field(True, description="If True, perform an open-state reconciliation before relying solely on journal updates")
+    lumu_tenant_concurrency_cap: int = Field(3, description="Maximum number of tenants processed in parallel per polling cycle")
+    lumu_tenant_cycle_jitter_max_seconds: int = Field(5, description="Max random delay before each tenant run to reduce synchronized API bursts")
+    lumu_defender_budget_minute_limit: int = Field(35, description="Per-tenant Defender request budget per minute")
+    lumu_defender_budget_day_limit: int = Field(8000, description="Per-tenant Defender request budget per day (UTC)")
+    lumu_defender_budget_enforce: bool = Field(True, description="If True, enforce Defender minute/day budgets before requests")
+    lumu_journal_items_per_page: int = Field(100, description="Requested incident updates page size for Defender journal polling")
+    lumu_journal_delay_time_seconds: int = Field(15, description="Long-poll delay parameter for Defender updates endpoint")
+    lumu_journal_max_pages_per_cycle: int = Field(2, description="Maximum Defender update pages processed per tenant in one cycle")
+    lumu_defender_max_items_param: int = Field(500, description="Value used for Defender max-items query parameter when enabled")
+    lumu_defender_use_max_items_param: bool = Field(True, description="If True, include max-items on supported Defender list endpoints")
+    lumu_defender_global_min_interval_seconds: float = Field(2.5, description="Global minimum spacing between Defender requests")
+    lumu_defender_journal_min_interval_seconds: float = Field(5.0, description="Minimum spacing between Defender journal update requests")
+    lumu_defender_journal_retry_after_floor_seconds: float = Field(30.0, description="Minimum wait used for Defender journal retries after 429")
+    lumu_defender_endpoint_cooldown_default_seconds: int = Field(60, description="Default endpoint cooldown after Defender 429")
+    lumu_defender_journal_circuit_breaker_enabled: bool = Field(True, description="Enable circuit breaker for Defender journal endpoint")
+    lumu_defender_journal_circuit_breaker_threshold: int = Field(3, description="Consecutive 429 threshold to open journal circuit breaker")
+    lumu_defender_journal_circuit_breaker_open_seconds: int = Field(600, description="How long the journal circuit breaker remains open")
+    lumu_defender_journal_circuit_breaker_half_open_probe_seconds: int = Field(60, description="Probe interval while journal circuit breaker is half-open")
+    lumu_defender_retry_respect_retry_after: bool = Field(True, description="If True, respect Retry-After response headers on Defender 429")
 
     # Resilience
     lumu_max_retries: int = Field(5, description="Maximum number of retries for Lumu API requests (429/5xx)")
@@ -68,6 +92,98 @@ class Settings(BaseSettings):
             return value
         if not value.strip():
             raise ValueError("kafka_topic must be a non-empty string when provided")
+        return value
+
+    @field_validator(
+        "polling_interval_minutes",
+        "lumu_open_state_reconciliation_minutes",
+        "lumu_open_state_failure_backoff_minutes",
+        "lumu_tenant_concurrency_cap",
+        "lumu_defender_budget_minute_limit",
+        "lumu_defender_budget_day_limit",
+        "lumu_journal_items_per_page",
+        "lumu_journal_delay_time_seconds",
+        "lumu_journal_max_pages_per_cycle",
+        "lumu_defender_max_items_param",
+        "lumu_defender_endpoint_cooldown_default_seconds",
+        "lumu_defender_journal_circuit_breaker_threshold",
+        "lumu_defender_journal_circuit_breaker_open_seconds",
+        "lumu_defender_journal_circuit_breaker_half_open_probe_seconds",
+        mode="after",
+    )
+    @classmethod
+    def positive_ints_must_be_gt_zero(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("value must be greater than zero")
+        return value
+
+    @field_validator("lumu_open_state_jitter_seconds", mode="after")
+    @classmethod
+    def jitter_must_be_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("lumu_open_state_jitter_seconds must be non-negative")
+        return value
+
+    @field_validator("lumu_tenant_cycle_jitter_max_seconds", mode="after")
+    @classmethod
+    def tenant_jitter_must_be_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("lumu_tenant_cycle_jitter_max_seconds must be non-negative")
+        return value
+
+    @field_validator("lumu_open_state_max_backoff_minutes", mode="after")
+    @classmethod
+    def max_backoff_must_cover_base_backoff(cls, value: int, info) -> int:
+        base_backoff = info.data.get("lumu_open_state_failure_backoff_minutes")
+        if value <= 0:
+            raise ValueError("lumu_open_state_max_backoff_minutes must be greater than zero")
+        if base_backoff is not None and value < base_backoff:
+            raise ValueError("lumu_open_state_max_backoff_minutes must be greater than or equal to lumu_open_state_failure_backoff_minutes")
+        return value
+
+    @field_validator("lumu_defender_budget_day_limit", mode="after")
+    @classmethod
+    def defender_day_budget_must_cover_minute_budget(cls, value: int, info) -> int:
+        minute_limit = info.data.get("lumu_defender_budget_minute_limit")
+        if value <= 0:
+            raise ValueError("lumu_defender_budget_day_limit must be greater than zero")
+        if minute_limit is not None and value < minute_limit:
+            raise ValueError("lumu_defender_budget_day_limit must be greater than or equal to lumu_defender_budget_minute_limit")
+        return value
+
+    @field_validator(
+        "lumu_defender_global_min_interval_seconds",
+        "lumu_defender_journal_min_interval_seconds",
+        "lumu_defender_journal_retry_after_floor_seconds",
+        mode="after",
+    )
+    @classmethod
+    def positive_floats_must_be_gt_zero(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("value must be greater than zero")
+        return value
+
+    @field_validator("lumu_defender_journal_circuit_breaker_threshold", mode="after")
+    @classmethod
+    def breaker_threshold_must_be_valid(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("lumu_defender_journal_circuit_breaker_threshold must be greater than or equal to 1")
+        return value
+
+    @field_validator("lumu_defender_journal_circuit_breaker_half_open_probe_seconds", mode="after")
+    @classmethod
+    def half_open_probe_must_fit_open_window(cls, value: int, info) -> int:
+        open_seconds = info.data.get("lumu_defender_journal_circuit_breaker_open_seconds")
+        if open_seconds is not None and value > open_seconds:
+            raise ValueError("lumu_defender_journal_circuit_breaker_half_open_probe_seconds must be less than or equal to lumu_defender_journal_circuit_breaker_open_seconds")
+        return value
+
+    @field_validator("lumu_defender_journal_min_interval_seconds", mode="after")
+    @classmethod
+    def journal_interval_must_cover_global_interval(cls, value: float, info) -> float:
+        global_interval = info.data.get("lumu_defender_global_min_interval_seconds")
+        if global_interval is not None and value < global_interval:
+            raise ValueError("lumu_defender_journal_min_interval_seconds must be greater than or equal to lumu_defender_global_min_interval_seconds")
         return value
 
 
