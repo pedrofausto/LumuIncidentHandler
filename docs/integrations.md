@@ -26,6 +26,7 @@ The runtime applies a fixed source hierarchy:
 - **Contacts Fallback**: `GET /api/incidents/{incident_uuid}/contacts?key=...` is used only when Defender details plus Managed secops data do not provide enough endpoint breadth or endpoint context.
 - **Reconciliation Strategy**: Full open-incident sweeps are scheduled per tenant with persisted due times and exponential scheduler backoff after `/api/incidents/all` failures.
 - **Quota Governance**: Defender requests are budget-gated per tenant key using conservative limits (`35 req/min`, `8000 req/day`) derived from published Defender quotas (`50/min`, `10,000/day`).
+- **Profile-Based Rate Control**: Runtime rate behavior is selected by `LUMU_RATE_POLICY_PROFILE` (`strict`, `balanced`, `aggressive`) instead of exposing every low-level timing variable in standard `.env` usage.
 - **List Optimization**: Journal/state list endpoints can include `max-items`; if Defender rejects it (`400/422`) the handler disables that parameter for the endpoint for the remainder of the process and retries without it.
 - **Near-Daily-Cap Degradation**: When a tenant nears daily budget threshold, non-critical reconciliation sweeps are skipped and journal polling is automatically slowed/capped.
 - **Retry-After Cooldown Scheduler**: `429` responses are deferred using `Retry-After` as `next_allowed_at` cooldown, instead of immediate repeated retries.

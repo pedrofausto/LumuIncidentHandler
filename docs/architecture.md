@@ -86,3 +86,4 @@ Responsible for publishing incidents to Kafka.
 Uses `pydantic-settings` to manage environment-based configuration with strict type validation, handling secrets securely via `SecretStr`.
 - Multi-tenant runtime does not require a static `KAFKA_TOPIC`; topic routing is computed per tenant.
 - `KAFKA_DELIVERY_TIMEOUT_SECONDS` bounds how long one publish waits for broker acknowledgement.
+- Rate control is profile-driven (`strict`, `balanced`, `aggressive`) through `resolve_rate_policy()`, with optional advanced expert overrides only when explicitly enabled.

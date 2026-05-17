@@ -19,6 +19,7 @@ from .incident_builder import build_incident_event
 from .kafka_client import KafkaClient
 from .lumu_client import LumuSession
 from .payload_serializer import normalize_customer_topic, serialize_incident_event
+from .rate_policy import resolve_rate_policy_from_settings
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -132,10 +133,11 @@ async def run_journal_sync(
 ) -> JournalSyncResult:
     result = JournalSyncResult()
     settings = get_settings()
-    items_per_page = settings.lumu_journal_items_per_page
-    max_items_per_page = settings.lumu_journal_items_per_page
-    delay_time_seconds = settings.lumu_journal_delay_time_seconds
-    max_pages_per_cycle = settings.lumu_journal_max_pages_per_cycle
+    policy = resolve_rate_policy_from_settings(settings)
+    items_per_page = policy.journal_items_per_page
+    max_items_per_page = policy.journal_items_per_page
+    delay_time_seconds = policy.journal_delay_time_seconds
+    max_pages_per_cycle = policy.journal_max_pages_per_cycle
     if getattr(client, "is_defender_near_daily_cap", None) and client.is_defender_near_daily_cap(company_key, threshold=0.85):
         delay_time_seconds = max(delay_time_seconds, 30)
         max_pages_per_cycle = min(max_pages_per_cycle, 1)
@@ -574,11 +576,12 @@ async def run_tenant_batch(
     tenant_registry: Dict[str, TenantRuntime],
     settings,
 ) -> None:
-    semaphore = asyncio.Semaphore(settings.lumu_tenant_concurrency_cap)
+    policy = resolve_rate_policy_from_settings(settings)
+    semaphore = asyncio.Semaphore(policy.tenant_concurrency_cap)
     runtime_items = list(tenant_registry.items())
 
     async def run_tenant_with_cap(runtime: TenantRuntime) -> None:
-        jitter_seconds = _compute_tenant_cycle_jitter_seconds(settings.lumu_tenant_cycle_jitter_max_seconds)
+        jitter_seconds = _compute_tenant_cycle_jitter_seconds(policy.tenant_cycle_jitter_max_seconds)
         logger.debug(
             "Tenant queued tenant_uuid=%s tenant_name=%s jitter=%.2fs",
             runtime.tenant_uuid,
@@ -626,6 +629,7 @@ async def run_tenant_batch(
 
 async def run_loop():
     settings = get_settings()
+    policy = resolve_rate_policy_from_settings(settings)
     interval_seconds = settings.polling_interval_minutes * 60
     analyzers_by_tenant: Dict[str, Analyzer] = {}
     tenant_registry: Dict[str, TenantRuntime] = {}
@@ -639,17 +643,17 @@ async def run_loop():
     )
     logger.info(
         "Defender budget config enforce=%s minute_limit=%s day_limit=%s journal_items=%s journal_delay=%ss journal_pages_cap=%s",
-        settings.lumu_defender_budget_enforce,
-        settings.lumu_defender_budget_minute_limit,
-        settings.lumu_defender_budget_day_limit,
-        settings.lumu_journal_items_per_page,
-        settings.lumu_journal_delay_time_seconds,
-        settings.lumu_journal_max_pages_per_cycle,
+        policy.defender_budget_enforce,
+        policy.defender_budget_minute_limit,
+        policy.defender_budget_day_limit,
+        policy.journal_items_per_page,
+        policy.journal_delay_time_seconds,
+        policy.journal_max_pages_per_cycle,
     )
     logger.info(
         "Tenant scheduler config concurrency_cap=%s cycle_jitter_max_seconds=%s",
-        settings.lumu_tenant_concurrency_cap,
-        settings.lumu_tenant_cycle_jitter_max_seconds,
+        policy.tenant_concurrency_cap,
+        policy.tenant_cycle_jitter_max_seconds,
     )
 
     try:

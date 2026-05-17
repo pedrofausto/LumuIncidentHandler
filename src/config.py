@@ -1,5 +1,7 @@
-﻿from functools import lru_cache
-from typing import Optional
+from functools import lru_cache
+import logging
+import os
+from typing import Literal, Optional
 
 from pydantic import EmailStr, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -59,6 +61,9 @@ class Settings(BaseSettings):
     lumu_defender_journal_circuit_breaker_open_seconds: int = Field(600, description="How long the journal circuit breaker remains open")
     lumu_defender_journal_circuit_breaker_half_open_probe_seconds: int = Field(60, description="Probe interval while journal circuit breaker is half-open")
     lumu_defender_retry_respect_retry_after: bool = Field(True, description="If True, respect Retry-After response headers on Defender 429")
+    lumu_rate_policy_profile: Literal["strict", "balanced", "aggressive"] = Field("balanced", description="High-level rate policy profile")
+    lumu_rate_policy_tenant_cap: Optional[int] = Field(None, description="Optional tenant concurrency override")
+    lumu_rate_policy_advanced: bool = Field(False, description="If True, expert low-level rate vars are honored")
 
     # Resilience
     lumu_max_retries: int = Field(5, description="Maximum number of retries for Lumu API requests (429/5xx)")
@@ -186,7 +191,77 @@ class Settings(BaseSettings):
             raise ValueError("lumu_defender_journal_min_interval_seconds must be greater than or equal to lumu_defender_global_min_interval_seconds")
         return value
 
+    @field_validator("lumu_rate_policy_tenant_cap", mode="after")
+    @classmethod
+    def tenant_cap_override_must_be_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 1:
+            raise ValueError("lumu_rate_policy_tenant_cap must be greater than or equal to 1")
+        return value
+
+    def resolve_rate_policy(self):
+        from .rate_policy import build_rate_policy
+
+        expert_values = {
+            "tenant_concurrency_cap": self.lumu_tenant_concurrency_cap,
+            "tenant_cycle_jitter_max_seconds": self.lumu_tenant_cycle_jitter_max_seconds,
+            "defender_budget_enforce": self.lumu_defender_budget_enforce,
+            "defender_budget_minute_limit": self.lumu_defender_budget_minute_limit,
+            "defender_budget_day_limit": self.lumu_defender_budget_day_limit,
+            "journal_items_per_page": self.lumu_journal_items_per_page,
+            "journal_delay_time_seconds": self.lumu_journal_delay_time_seconds,
+            "journal_max_pages_per_cycle": self.lumu_journal_max_pages_per_cycle,
+            "defender_global_min_interval_seconds": self.lumu_defender_global_min_interval_seconds,
+            "defender_journal_min_interval_seconds": self.lumu_defender_journal_min_interval_seconds,
+            "defender_journal_retry_after_floor_seconds": self.lumu_defender_journal_retry_after_floor_seconds,
+            "defender_endpoint_cooldown_default_seconds": self.lumu_defender_endpoint_cooldown_default_seconds,
+            "defender_journal_circuit_breaker_enabled": self.lumu_defender_journal_circuit_breaker_enabled,
+            "defender_journal_circuit_breaker_threshold": self.lumu_defender_journal_circuit_breaker_threshold,
+            "defender_journal_circuit_breaker_open_seconds": self.lumu_defender_journal_circuit_breaker_open_seconds,
+            "defender_journal_circuit_breaker_half_open_probe_seconds": self.lumu_defender_journal_circuit_breaker_half_open_probe_seconds,
+            "defender_retry_respect_retry_after": self.lumu_defender_retry_respect_retry_after,
+            "max_retries": self.lumu_max_retries,
+            "initial_backoff": self.lumu_initial_backoff,
+            "defender_max_items_param": self.lumu_defender_max_items_param,
+            "defender_use_max_items_param": self.lumu_defender_use_max_items_param,
+        }
+
+        if not self.lumu_rate_policy_advanced:
+            deprecated_env_vars = [
+                "LUMU_TENANT_CONCURRENCY_CAP",
+                "LUMU_TENANT_CYCLE_JITTER_MAX_SECONDS",
+                "LUMU_DEFENDER_BUDGET_ENFORCE",
+                "LUMU_DEFENDER_BUDGET_MINUTE_LIMIT",
+                "LUMU_DEFENDER_BUDGET_DAY_LIMIT",
+                "LUMU_JOURNAL_ITEMS_PER_PAGE",
+                "LUMU_JOURNAL_DELAY_TIME_SECONDS",
+                "LUMU_JOURNAL_MAX_PAGES_PER_CYCLE",
+                "LUMU_DEFENDER_GLOBAL_MIN_INTERVAL_SECONDS",
+                "LUMU_DEFENDER_JOURNAL_MIN_INTERVAL_SECONDS",
+                "LUMU_DEFENDER_JOURNAL_RETRY_AFTER_FLOOR_SECONDS",
+                "LUMU_DEFENDER_ENDPOINT_COOLDOWN_DEFAULT_SECONDS",
+                "LUMU_DEFENDER_JOURNAL_CIRCUIT_BREAKER_ENABLED",
+                "LUMU_DEFENDER_JOURNAL_CIRCUIT_BREAKER_THRESHOLD",
+                "LUMU_DEFENDER_JOURNAL_CIRCUIT_BREAKER_OPEN_SECONDS",
+                "LUMU_DEFENDER_JOURNAL_CIRCUIT_BREAKER_HALF_OPEN_PROBE_SECONDS",
+                "LUMU_DEFENDER_RETRY_RESPECT_RETRY_AFTER",
+                "LUMU_MAX_RETRIES",
+                "LUMU_INITIAL_BACKOFF",
+                "LUMU_DEFENDER_MAX_ITEMS_PARAM",
+                "LUMU_DEFENDER_USE_MAX_ITEMS_PARAM",
+            ]
+            present = [name for name in deprecated_env_vars if os.getenv(name) is not None]
+            if present:
+                logger.warning("Deprecated expert rate vars ignored under profile mode (advanced=false): %s", ",".join(present))
+
+        return build_rate_policy(
+            profile=self.lumu_rate_policy_profile,
+            tenant_cap_override=self.lumu_rate_policy_tenant_cap,
+            advanced=self.lumu_rate_policy_advanced,
+            expert_values=expert_values,
+        )
+
 
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
+

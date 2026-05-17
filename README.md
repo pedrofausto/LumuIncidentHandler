@@ -10,6 +10,7 @@ An automated monitor and alert system for the Lumu security platform. It polls f
 - **Journal-First Polling**: Uses the Defender journal as the hot path and schedules full open-state reconciliation instead of sweeping `/api/incidents/all` every cycle.
 - **Tenant Scheduler Smoothing**: Applies per-tenant cycle jitter and a global tenant concurrency cap to reduce synchronized Defender API bursts.
 - **Defender Budget Governance**: Enforces conservative per-tenant Defender budgets with minute/day windows, request gating, and endpoint capability fallback for `max-items`.
+- **Rate Policy Profiles**: Uses high-level profiles (`strict`, `balanced`, `aggressive`) to keep `.env` simple while preserving safe defaults.
 - **Intelligent Deduplication**: Uses a local JSON-based state file to ensure alerts are sent only once.
 - **Kafka Integration**: Publishes enriched incident payloads to Kafka using the official Confluent Python client.
 - **Structured Payloads**: Emits Lumu fields under `data.lumu`, endpoint host/IP pairs as `srchost`/`srcip`, and stable handler identity via `agent.id` plus detected `agent.ip`.

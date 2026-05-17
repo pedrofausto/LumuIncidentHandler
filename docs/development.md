@@ -60,6 +60,9 @@ The Docker deployment includes several security-hardening measures:
 | `LUMU_DEFENDER_KEY` | - | Legacy single-tenant key (unused in multi-tenant runtime). |
 | `CUSTOMER_UUID` | - | Legacy single-tenant UUID (unused in multi-tenant runtime). |
 | `POLLING_INTERVAL_MINUTES`| `5` | Frequency of Lumu polling in minutes. |
+| `LUMU_RATE_POLICY_PROFILE` | `balanced` | High-level rate policy (`strict`, `balanced`, `aggressive`) that controls cooldown/timing defaults. |
+| `LUMU_RATE_POLICY_TENANT_CAP` | - | Optional override for tenant concurrency cap on top of profile defaults. |
+| `LUMU_RATE_POLICY_ADVANCED` | `False` | When true, low-level expert rate vars are honored; otherwise profile mode is used. |
 | `VERIFY_SSL` | `True` | Enable or disable SSL verification for all API clients. |
 | `LUMU_OPEN_STATE_RECONCILIATION_MINUTES` | `15` | How often each tenant runs a full open-incident reconciliation sweep. |
 | `LUMU_OPEN_STATE_JITTER_SECONDS` | `120` | Per-tenant jitter applied to the reconciliation schedule to avoid burst scans. |

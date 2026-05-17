@@ -7,12 +7,14 @@ import email.utils
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from .config import get_settings
+from .rate_policy import resolve_rate_policy_from_settings
 
 logger = logging.getLogger(__name__)
 
 class LumuSession:
     def __init__(self):
         self.settings = get_settings()
+        self.rate_policy = resolve_rate_policy_from_settings(self.settings)
         self.base_url = self.settings.lumu_api_base_url.rstrip("/")
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0, verify=self.settings.verify_ssl, limits=limits)
@@ -77,7 +79,7 @@ class LumuSession:
                     tenant_next_allowed = self._journal_next_allowed_by_company.get(company, 0.0)
                     if now < tenant_next_allowed:
                         raise RuntimeError("journal_tenant_cooldown")
-                    if self.settings.lumu_defender_journal_circuit_breaker_enabled:
+                    if self.rate_policy.defender_journal_circuit_breaker_enabled:
                         if self._journal_breaker_state == "open":
                             if now < self._journal_breaker_open_until:
                                 raise RuntimeError("journal_circuit_open")
@@ -97,10 +99,10 @@ class LumuSession:
                 endpoint_wait = max(0.0, endpoint_next - now)
                 sleep_for = max(global_wait, endpoint_wait)
                 if sleep_for <= 0:
-                    global_min = float(self.settings.lumu_defender_global_min_interval_seconds)
+                    global_min = float(self.rate_policy.defender_global_min_interval_seconds)
                     self._defender_next_allowed_global_at = now + global_min
                     if self._is_journal_endpoint(endpoint):
-                        journal_min = float(self.settings.lumu_defender_journal_min_interval_seconds)
+                        journal_min = float(self.rate_policy.defender_journal_min_interval_seconds)
                         self._defender_next_allowed_by_endpoint[admission_key] = max(
                             self._defender_next_allowed_by_endpoint.get(admission_key, 0.0),
                             now + journal_min,
@@ -137,9 +139,9 @@ class LumuSession:
                     self._journal_next_allowed_by_company.get(company, 0.0),
                     next_allowed,
                 )
-                threshold = int(self.settings.lumu_defender_journal_circuit_breaker_threshold)
-                if self.settings.lumu_defender_journal_circuit_breaker_enabled and self._defender_consecutive_429_by_endpoint[admission_key] >= threshold:
-                    open_seconds = float(self.settings.lumu_defender_journal_circuit_breaker_open_seconds)
+                threshold = int(self.rate_policy.defender_journal_circuit_breaker_threshold)
+                if self.rate_policy.defender_journal_circuit_breaker_enabled and self._defender_consecutive_429_by_endpoint[admission_key] >= threshold:
+                    open_seconds = float(self.rate_policy.defender_journal_circuit_breaker_open_seconds)
                     self._journal_breaker_state = "open"
                     self._journal_breaker_open_until = now + open_seconds
                     self._journal_breaker_next_probe_at = self._journal_breaker_open_until
@@ -150,7 +152,7 @@ class LumuSession:
                         open_seconds,
                     )
                 elif self._journal_breaker_state == "half_open":
-                    open_seconds = float(self.settings.lumu_defender_journal_circuit_breaker_open_seconds)
+                    open_seconds = float(self.rate_policy.defender_journal_circuit_breaker_open_seconds)
                     self._journal_breaker_state = "open"
                     self._journal_breaker_open_until = now + open_seconds
                     self._journal_breaker_next_probe_at = self._journal_breaker_open_until
@@ -208,14 +210,14 @@ class LumuSession:
             state["day_count"] = 0
 
     async def _wait_for_defender_budget(self, company_key: str) -> None:
-        if not self.settings.lumu_defender_budget_enforce:
+        if not self.rate_policy.defender_budget_enforce:
             return
         while True:
             sleep_for = 0.0
             async with self._defender_budget_lock:
                 state = self._get_defender_budget_state(company_key)
-                minute_limit = self.settings.lumu_defender_budget_minute_limit
-                day_limit = self.settings.lumu_defender_budget_day_limit
+                minute_limit = self.rate_policy.defender_budget_minute_limit
+                day_limit = self.rate_policy.defender_budget_day_limit
                 now_utc = datetime.now(timezone.utc)
                 self._refresh_defender_budget_windows(state, now_utc)
                 if state["minute_count"] < minute_limit and state["day_count"] < day_limit:
@@ -244,7 +246,7 @@ class LumuSession:
             return False
         now_utc = datetime.now(timezone.utc)
         self._refresh_defender_budget_windows(state, now_utc)
-        day_limit = max(1, self.settings.lumu_defender_budget_day_limit)
+        day_limit = max(1, self.rate_policy.defender_budget_day_limit)
         return state["day_count"] >= int(day_limit * threshold)
 
     def get_defender_budget_snapshot(self, company_key: str) -> Dict[str, int]:
@@ -253,18 +255,18 @@ class LumuSession:
         self._refresh_defender_budget_windows(state, now_utc)
         return {
             "minute_count": int(state["minute_count"]),
-            "minute_limit": int(self.settings.lumu_defender_budget_minute_limit),
+            "minute_limit": int(self.rate_policy.defender_budget_minute_limit),
             "day_count": int(state["day_count"]),
-            "day_limit": int(self.settings.lumu_defender_budget_day_limit),
+            "day_limit": int(self.rate_policy.defender_budget_day_limit),
         }
 
     def _maybe_attach_max_items(self, params: Optional[Dict[str, Any]], endpoint_name: str) -> Dict[str, Any]:
         merged = dict(params or {})
-        if not self.settings.lumu_defender_use_max_items_param:
+        if not self.rate_policy.defender_use_max_items_param:
             return merged
         if endpoint_name in self._defender_max_items_unsupported_endpoints:
             return merged
-        merged["max-items"] = self.settings.lumu_defender_max_items_param
+        merged["max-items"] = self.rate_policy.defender_max_items_param
         return merged
 
     async def _wait_for_rate_limit(self, url: str) -> None:
@@ -353,8 +355,8 @@ class LumuSession:
             headers["Authorization"] = self.bearer_token
             headers["Accept"] = "application/json"
 
-        max_retries = self.settings.lumu_max_retries
-        initial_backoff = self.settings.lumu_initial_backoff
+        max_retries = self.rate_policy.max_retries
+        initial_backoff = self.rate_policy.initial_backoff
         if endpoint_name and params and endpoint_name in self._defender_max_items_unsupported_endpoints and "max-items" in params:
             params = dict(params)
             params.pop("max-items", None)
@@ -379,11 +381,11 @@ class LumuSession:
 
                 if response.status_code == 429:
                     self.rate_limit_hits += 1
-                    retry_after_seconds = self._parse_retry_after_seconds(response) if self.settings.lumu_defender_retry_respect_retry_after else 0.0
-                    default_cooldown = float(self.settings.lumu_defender_endpoint_cooldown_default_seconds)
+                    retry_after_seconds = self._parse_retry_after_seconds(response) if self.rate_policy.defender_retry_respect_retry_after else 0.0
+                    default_cooldown = float(self.rate_policy.defender_endpoint_cooldown_default_seconds)
                     cooldown_seconds = max(default_cooldown, retry_after_seconds)
                     if self._is_journal_endpoint(endpoint_name):
-                        cooldown_seconds = max(cooldown_seconds, float(self.settings.lumu_defender_journal_retry_after_floor_seconds))
+                        cooldown_seconds = max(cooldown_seconds, float(self.rate_policy.defender_journal_retry_after_floor_seconds))
                     await self._register_defender_429(endpoint_name, cooldown_seconds, resolved_company_key)
                     if self._is_journal_endpoint(endpoint_name):
                         logger.warning(
@@ -460,7 +462,7 @@ class LumuSession:
                 if is_defender_request:
                     await self._register_defender_429(
                         endpoint_name,
-                        float(self.settings.lumu_defender_endpoint_cooldown_default_seconds),
+                        float(self.rate_policy.defender_endpoint_cooldown_default_seconds),
                         company_key,
                     )
                 if attempt == max_retries:
