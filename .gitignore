@@ -24,8 +24,7 @@ src/*_new_method.py
 test_*.py
 test.py
 poc_*.py
-!tests/
-!tests/**/*.py
+tests/
 
 # Ignore all .md files by default
 **/*.md
