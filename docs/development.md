@@ -138,6 +138,31 @@ Kafka messages keep the outer wrapper:
 
 Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. The payload also includes activity enrichments under `data.lumu.activity_incident_details` and `data.lumu.endpoint_context`, with endpoint context sourced from managed event details and any concrete Defender contact/detail rows. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
 
+### Rate-Control Behavior
+
+- Defender cooldown/counter keys are canonical and tenant-scoped (`endpoint:tenant`).
+- Journal breaker state is tenant-scoped, so one tenant opening the breaker does not suppress other tenants.
+- `Retry-After` is honored for cooldown scheduling.
+- Long non-journal cooldowns are fail-fast (structured exception) to avoid blocking the cycle.
+- Details/contacts enrichment is paced by per-tenant semaphores (profile-driven).
+
+### Rate Control FAQ
+
+**Q: Why does one tenant show cooldown skips while others still process?**  
+A: Cooldowns and breaker state are tenant-scoped. A throttled tenant is deferred independently, and other tenants continue polling.
+
+**Q: What happens when Defender returns a very large `Retry-After`?**  
+A: The tenant/endpoint is deferred until `next_allowed_at`. The runtime does not busy-retry the same request in a tight loop.
+
+**Q: Will new incidents stop completely during cooldown?**  
+A: No. Discovery is still attempted each cycle. What may degrade is deep enrichment (for example details/contacts) when endpoint cooldown is active.
+
+**Q: Why are some incidents published with partial enrichment?**  
+A: Long non-journal cooldowns raise a structured cooldown exception and the pipeline continues with available data to avoid cycle stalls.
+
+**Q: How do I tune behavior without adding many env vars?**  
+A: Use `LUMU_RATE_POLICY_PROFILE` (`strict`, `balanced`, `aggressive`). Use `LUMU_RATE_POLICY_TENANT_CAP` only when you need a specific tenant concurrency override.
+
 ### Internal Pipeline
 
 The runtime is split into explicit stages:

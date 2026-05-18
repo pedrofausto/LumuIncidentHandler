@@ -31,6 +31,10 @@ The runtime applies a fixed source hierarchy:
 - **Near-Daily-Cap Degradation**: When a tenant nears daily budget threshold, non-critical reconciliation sweeps are skipped and journal polling is automatically slowed/capped.
 - **Retry-After Cooldown Scheduler**: `429` responses are deferred using `Retry-After` as `next_allowed_at` cooldown, instead of immediate repeated retries.
 - **Tenant-Scoped Journal Cooldown**: cooldown for `open-incidents/updates` is keyed by tenant API key + endpoint, so one throttled tenant does not block others.
+- **Canonical Defender Keying**: all Defender endpoint cooldown/counter tracking uses `endpoint:tenant` keying.
+- **Tenant Breaker Isolation**: journal breaker transitions are tenant-scoped, not global.
+- **Non-Blocking Cooldown Degrade**: long cooldowns for details/contacts raise a structured cooldown exception and continue with partial enrichment.
+- **Per-Tenant Detail Pacing**: details/contacts calls are concurrency-limited per tenant by rate profile.
 
 ### 3. Context Enrichment (Defender API)
 - **Context Summary**: Fetches high-level summaries, MITRE ATT&CK technique mappings, and recommended playbooks.

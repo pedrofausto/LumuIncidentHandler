@@ -42,6 +42,10 @@ Handles all communication with Lumu's Managed and Defender APIs.
 - **Tenant Bootstrap**: Discovers supervised tenants and fetches each tenant Defender API key once at bootstrap.
 - **Defender API**: Fetches incident lists, endpoint details, and fallback contact records.
 - **Budget Governor**: Enforces per-tenant Defender request budgets (minute/day windows) before every Defender call, including retries.
+- **Canonical Tenant Keying**: Cooldown and 429 counters are keyed by `endpoint:tenant` for all Defender endpoints.
+- **Tenant-Scoped Journal Breaker**: Journal circuit-breaker state is maintained per tenant, never globally.
+- **Structured Cooldown Exception**: Long non-journal cooldowns fail fast via `LumuEndpointCooldownException` so enrichment can degrade without blocking the cycle.
+- **Per-Tenant Detail Pacing**: Incident details/contacts calls are semaphore-limited per tenant using profile defaults.
 - **Capability Fallback**: Tries `max-items` on list endpoints and auto-disables it per endpoint if Defender rejects the parameter.
 - It implements a thread-safe `httpx.AsyncClient` for high-performance concurrent I/O.
 
