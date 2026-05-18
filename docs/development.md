@@ -163,6 +163,17 @@ A: Long non-journal cooldowns raise a structured cooldown exception and the pipe
 **Q: How do I tune behavior without adding many env vars?**  
 A: Use `LUMU_RATE_POLICY_PROFILE` (`strict`, `balanced`, `aggressive`). Use `LUMU_RATE_POLICY_TENANT_CAP` only when you need a specific tenant concurrency override.
 
+### Local Private Ignore Rules
+
+Use `.git/info/exclude` for local ignore patterns you do not want to publish in the repository.  
+This file follows `.gitignore` syntax but is local-only and is not committed.
+
+- Path: `.git/info/exclude`
+- Scope: current clone only
+- Use cases: local tooling artifacts, stack-specific cache patterns, personal scratch paths
+
+If you want shared behavior across all local repositories on your machine, use a global excludes file via `git config --global core.excludesFile <path>`.
+
 ### Internal Pipeline
 
 The runtime is split into explicit stages:

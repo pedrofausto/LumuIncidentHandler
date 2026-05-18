@@ -1,44 +1,14 @@
-# Environment and Virtual Environments
-.env
-venv/
-__pycache__/
-*.pyc
-
-# IDE and Project Workspace
-*.code-workspace
-.vscode/
-.idea/
-
-# Debugging and Internal Data
-debug_*.py
-_*.py
-_*.json
-cmp.json
-lumu_details.json
-data/
-/*.html
-**/*.log
-src/*_new_method.py
-
-# Testing and Proofs
-test_*.py
-test.py
-poc_*.py
-tests/
-
-# Ignore all .md files by default
+# Documentation policy
 **/*.md
 
-# Exceptions to keep
+# Documentation exceptions
 !/README.md
 !**/docs/**/*.md
-# scratch/ is ignored by default below
 
-# Unneeded execution and diagnostic files
-lumu_logs.txt
+# Generic local artifacts
+data/
 config/
-
-# Scratch and Temp directories
-scratch/
+*.log
 tmp/
+scratch/
 .agent/
