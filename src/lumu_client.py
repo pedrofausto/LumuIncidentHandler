@@ -11,6 +11,16 @@ from .rate_policy import resolve_rate_policy_from_settings
 
 logger = logging.getLogger(__name__)
 
+class LumuEndpointCooldownException(Exception):
+    def __init__(self, endpoint_name: str, tenant_key_normalized: str, cooldown_remaining_seconds: float, reason_code: str):
+        self.endpoint_name = endpoint_name
+        self.tenant_key_normalized = tenant_key_normalized
+        self.cooldown_remaining_seconds = float(cooldown_remaining_seconds)
+        self.reason_code = reason_code
+        super().__init__(
+            f"{reason_code} endpoint={endpoint_name} tenant={tenant_key_normalized} cooldown={cooldown_remaining_seconds:.2f}s"
+        )
+
 class LumuSession:
     def __init__(self):
         self.settings = get_settings()
@@ -33,10 +43,11 @@ class LumuSession:
         self._defender_next_allowed_by_endpoint: Dict[str, float] = {}
         self._journal_next_allowed_by_company: Dict[str, float] = {}
         self._defender_consecutive_429_by_endpoint: Dict[str, int] = {}
-        self._journal_breaker_state = "closed"
-        self._journal_breaker_open_until = 0.0
-        self._journal_breaker_next_probe_at = 0.0
-        self._journal_half_open_probe_in_flight = False
+        self._journal_breaker_state_by_company: Dict[str, str] = {}
+        self._journal_breaker_open_until_by_company: Dict[str, float] = {}
+        self._journal_breaker_next_probe_at_by_company: Dict[str, float] = {}
+        self._journal_half_open_probe_in_flight_by_company: Dict[str, bool] = {}
+        self._details_semaphores_by_company: Dict[str, asyncio.Semaphore] = {}
 
     @staticmethod
     def _now_monotonic() -> float:
@@ -48,9 +59,7 @@ class LumuSession:
 
     def _admission_endpoint_key(self, endpoint_name: Optional[str], company_key: Optional[str]) -> str:
         endpoint = endpoint_name or "unknown_defender_endpoint"
-        if self._is_journal_endpoint(endpoint_name):
-            return f"{endpoint}:{self._normalize_company_key(company_key)}"
-        return endpoint
+        return f"{endpoint}:{self._normalize_company_key(company_key)}"
 
     def _parse_retry_after_seconds(self, response: httpx.Response) -> float:
         raw_retry_after = response.headers.get("Retry-After")
@@ -78,21 +87,27 @@ class LumuSession:
                     company = self._normalize_company_key(company_key)
                     tenant_next_allowed = self._journal_next_allowed_by_company.get(company, 0.0)
                     if now < tenant_next_allowed:
-                        raise RuntimeError("journal_tenant_cooldown")
+                        raise LumuEndpointCooldownException(endpoint, company, tenant_next_allowed - now, "journal_tenant_cooldown")
                     if self.rate_policy.defender_journal_circuit_breaker_enabled:
-                        if self._journal_breaker_state == "open":
-                            if now < self._journal_breaker_open_until:
-                                raise RuntimeError("journal_circuit_open")
-                            self._journal_breaker_state = "half_open"
-                            self._journal_breaker_next_probe_at = now
-                            self._journal_half_open_probe_in_flight = False
-                            logger.info("Journal circuit breaker transition open->half_open")
-                        if self._journal_breaker_state == "half_open":
-                            if now < self._journal_breaker_next_probe_at:
-                                raise RuntimeError("journal_circuit_open")
-                            if self._journal_half_open_probe_in_flight:
-                                raise RuntimeError("journal_circuit_open")
-                            self._journal_half_open_probe_in_flight = True
+                        state = self._journal_breaker_state_by_company.get(company, "closed")
+                        open_until = self._journal_breaker_open_until_by_company.get(company, 0.0)
+                        next_probe_at = self._journal_breaker_next_probe_at_by_company.get(company, 0.0)
+                        probe_in_flight = self._journal_half_open_probe_in_flight_by_company.get(company, False)
+                        if state == "open":
+                            if now < open_until:
+                                raise LumuEndpointCooldownException(endpoint, company, open_until - now, "journal_circuit_open")
+                            self._journal_breaker_state_by_company[company] = "half_open"
+                            self._journal_breaker_next_probe_at_by_company[company] = now
+                            self._journal_half_open_probe_in_flight_by_company[company] = False
+                            logger.info("Journal circuit breaker transition open->half_open tenant=%s", company)
+                            state = "half_open"
+                            next_probe_at = now
+                            probe_in_flight = False
+                        if state == "half_open":
+                            if now < next_probe_at or probe_in_flight:
+                                cooldown = max(0.0, next_probe_at - now)
+                                raise LumuEndpointCooldownException(endpoint, company, cooldown, "journal_circuit_open")
+                            self._journal_half_open_probe_in_flight_by_company[company] = True
 
                 global_wait = max(0.0, self._defender_next_allowed_global_at - now)
                 endpoint_next = self._defender_next_allowed_by_endpoint.get(admission_key, 0.0)
@@ -108,18 +123,30 @@ class LumuSession:
                             now + journal_min,
                         )
                     return
+                if not self._is_journal_endpoint(endpoint):
+                    max_blocking = float(self.rate_policy.non_journal_max_blocking_cooldown_seconds)
+                    if sleep_for > max_blocking:
+                        raise LumuEndpointCooldownException(
+                            endpoint,
+                            self._normalize_company_key(company_key),
+                            sleep_for,
+                            "endpoint_cooldown",
+                        )
             logger.info("Defender admission wait endpoint=%s wait=%.2fs", endpoint, sleep_for)
             await asyncio.sleep(sleep_for)
 
-    async def _register_defender_success(self, endpoint_name: Optional[str]) -> None:
+    async def _register_defender_success(self, endpoint_name: Optional[str], company_key: Optional[str]) -> None:
         endpoint = endpoint_name or "unknown_defender_endpoint"
+        admission_key = self._admission_endpoint_key(endpoint_name, company_key)
+        company = self._normalize_company_key(company_key)
         async with self._defender_admission_lock:
-            self._defender_consecutive_429_by_endpoint[endpoint] = 0
-            if self._is_journal_endpoint(endpoint) and self._journal_breaker_state == "half_open":
-                self._journal_breaker_state = "closed"
-                self._journal_half_open_probe_in_flight = False
-                self._journal_breaker_next_probe_at = 0.0
-                logger.info("Journal circuit breaker transition half_open->closed")
+            self._defender_consecutive_429_by_endpoint[admission_key] = 0
+            if self._is_journal_endpoint(endpoint) and self._journal_breaker_state_by_company.get(company) == "half_open":
+                self._journal_breaker_state_by_company[company] = "closed"
+                self._journal_half_open_probe_in_flight_by_company[company] = False
+                self._journal_breaker_next_probe_at_by_company[company] = 0.0
+                self._journal_breaker_open_until_by_company[company] = 0.0
+                logger.info("Journal circuit breaker transition half_open->closed tenant=%s", company)
 
     async def _register_defender_429(self, endpoint_name: Optional[str], cooldown_seconds: float, company_key: Optional[str] = None) -> None:
         endpoint = endpoint_name or "unknown_defender_endpoint"
@@ -140,24 +167,26 @@ class LumuSession:
                     next_allowed,
                 )
                 threshold = int(self.rate_policy.defender_journal_circuit_breaker_threshold)
+                current_state = self._journal_breaker_state_by_company.get(company, "closed")
                 if self.rate_policy.defender_journal_circuit_breaker_enabled and self._defender_consecutive_429_by_endpoint[admission_key] >= threshold:
                     open_seconds = float(self.rate_policy.defender_journal_circuit_breaker_open_seconds)
-                    self._journal_breaker_state = "open"
-                    self._journal_breaker_open_until = now + open_seconds
-                    self._journal_breaker_next_probe_at = self._journal_breaker_open_until
-                    self._journal_half_open_probe_in_flight = False
+                    self._journal_breaker_state_by_company[company] = "open"
+                    self._journal_breaker_open_until_by_company[company] = now + open_seconds
+                    self._journal_breaker_next_probe_at_by_company[company] = now + open_seconds
+                    self._journal_half_open_probe_in_flight_by_company[company] = False
                     logger.warning(
-                        "Journal circuit breaker transition to open consecutive_429=%s open_for=%.2fs",
+                        "Journal circuit breaker transition to open tenant=%s consecutive_429=%s open_for=%.2fs",
+                        company,
                         self._defender_consecutive_429_by_endpoint[admission_key],
                         open_seconds,
                     )
-                elif self._journal_breaker_state == "half_open":
+                elif current_state == "half_open":
                     open_seconds = float(self.rate_policy.defender_journal_circuit_breaker_open_seconds)
-                    self._journal_breaker_state = "open"
-                    self._journal_breaker_open_until = now + open_seconds
-                    self._journal_breaker_next_probe_at = self._journal_breaker_open_until
-                    self._journal_half_open_probe_in_flight = False
-                    logger.warning("Journal circuit breaker half_open probe failed; reopened for %.2fs", open_seconds)
+                    self._journal_breaker_state_by_company[company] = "open"
+                    self._journal_breaker_open_until_by_company[company] = now + open_seconds
+                    self._journal_breaker_next_probe_at_by_company[company] = now + open_seconds
+                    self._journal_half_open_probe_in_flight_by_company[company] = False
+                    logger.warning("Journal circuit breaker half_open probe failed tenant=%s reopened for %.2fs", company, open_seconds)
 
     def _is_defender_request(self, url: str) -> bool:
         normalized = str(url or "").lower()
@@ -393,7 +422,12 @@ class LumuSession:
                             resolved_company_key,
                             cooldown_seconds,
                         )
-                        raise RuntimeError("journal_tenant_cooldown")
+                        raise LumuEndpointCooldownException(
+                            endpoint_name or "unknown_defender_endpoint",
+                            resolved_company_key,
+                            cooldown_seconds,
+                            "journal_tenant_cooldown",
+                        )
                     if attempt == max_retries:
                         logger.error(f"Max retries reached for 429 error at {url}")
                         response.raise_for_status()
@@ -455,7 +489,7 @@ class LumuSession:
 
                 response.raise_for_status()
                 if is_defender_request:
-                    await self._register_defender_success(endpoint_name)
+                    await self._register_defender_success(endpoint_name, resolved_company_key)
                 return response
             
             except (httpx.RequestError, httpx.TimeoutException) as e:
@@ -562,10 +596,10 @@ class LumuSession:
                 company_key=company_key,
                 endpoint_name="open_incidents_updates",
             )
-        except RuntimeError as exc:
-            if str(exc) in {"journal_circuit_open", "journal_tenant_cooldown"}:
-                reason = str(exc)
-                cooldown_seconds = self.get_journal_next_allowed_seconds(company_key) if reason == "journal_tenant_cooldown" else 0.0
+        except LumuEndpointCooldownException as exc:
+            if exc.reason_code in {"journal_circuit_open", "journal_tenant_cooldown"}:
+                reason = exc.reason_code
+                cooldown_seconds = exc.cooldown_remaining_seconds
                 logger.info(
                     "Skipping Defender journal request due to rate guard reason=%s company_key=%s cooldown_remaining=%.2fs",
                     reason,
@@ -767,15 +801,21 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/details"
         params = {"key": company_key}
-        response = await self._request_with_retry(
-            "GET",
-            url,
-            params=params,
-            auth_required=False,
-            company_key=company_key,
-            endpoint_name="incident_details",
+        company = self._normalize_company_key(company_key)
+        semaphore = self._details_semaphores_by_company.setdefault(
+            company,
+            asyncio.Semaphore(max(1, int(self.rate_policy.details_per_tenant_concurrency))),
         )
-        return response.json()
+        async with semaphore:
+            response = await self._request_with_retry(
+                "GET",
+                url,
+                params=params,
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="incident_details",
+            )
+            return response.json()
 
     async def get_incident_contacts(self, company_key: str, incident_uuid: str) -> List[Dict[str, Any]]:
         """
@@ -783,14 +823,20 @@ class LumuSession:
         """
         url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/contacts"
         params = {"key": company_key}
-        response = await self._request_with_retry(
-            "GET",
-            url,
-            params=params,
-            auth_required=False,
-            company_key=company_key,
-            endpoint_name="incident_contacts",
+        company = self._normalize_company_key(company_key)
+        semaphore = self._details_semaphores_by_company.setdefault(
+            company,
+            asyncio.Semaphore(max(1, int(self.rate_policy.details_per_tenant_concurrency))),
         )
+        async with semaphore:
+            response = await self._request_with_retry(
+                "GET",
+                url,
+                params=params,
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="incident_contacts",
+            )
         data = response.json()
         if isinstance(data, list):
             return data

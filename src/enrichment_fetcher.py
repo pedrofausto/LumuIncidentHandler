@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import httpx
 
-from .lumu_client import LumuSession
+from .lumu_client import LumuSession, LumuEndpointCooldownException
 from .models import IncidentSourceBundle
 
 logger = logging.getLogger("lumu_monitor")
@@ -223,6 +223,15 @@ async def fetch_incident_bundle(
                     )
                 else:
                     logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
+            except LumuEndpointCooldownException as exc:
+                logger.warning(
+                    "contacts enrichment deferred incident=%s tenant=%s endpoint=%s reason=%s cooldown=%.2fs",
+                    incident_uuid,
+                    tenant_uuid,
+                    exc.endpoint_name,
+                    exc.reason_code,
+                    exc.cooldown_remaining_seconds,
+                )
             except Exception as exc:
                 logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
 

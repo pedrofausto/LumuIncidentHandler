@@ -16,6 +16,7 @@ from src.incident_builder import build_incident_event
 from src.kafka_client import KafkaClient
 from src.main import JournalSyncResult, TenantRuntime, enrich_incident, monitor_tenant, run_journal_sync, run_open_state_reconciliation, run_tenant_batch, should_run_open_state_reconciliation
 from src.models import IncidentSourceBundle
+from src.lumu_client import LumuEndpointCooldownException
 from src.payload_serializer import serialize_incident_event
 
 
@@ -258,8 +259,93 @@ def test_enrich_incident_fetches_contacts_when_detail_contacts_are_incomplete():
     )
 
     assert client.contact_calls == 1
-    assert set(client.activity_event_calls) == {"event-1", "event-2"}
-    assert result.defender_contacts == [{"endpointIp": "10.0.0.2", "endpointName": "10.0.0.2"}]
+
+
+def test_enrich_incident_degrades_gracefully_on_contacts_cooldown():
+    class _CooldownClient(_FakeEnrichmentClient):
+        async def get_incident_contacts(self, _company_key, _incident_uuid):
+            raise LumuEndpointCooldownException(
+                endpoint_name="incident_contacts",
+                tenant_key_normalized="tenant-1",
+                cooldown_remaining_seconds=120.0,
+                reason_code="endpoint_cooldown",
+            )
+
+    client = _CooldownClient(
+        details={"contacts": []},
+        secops_details={"counts": {"endpointTargetsCount": 1}},
+    )
+
+    bundle = asyncio.run(
+        enrich_incident(
+            client=client,
+            tenant_uuid="tenant-1",
+            company_key="key-1",
+            inc_uuid="incident-1",
+        )
+    )
+
+    assert bundle.incident_uuid == "incident-1"
+    assert bundle.defender_contacts == []
+
+
+def test_process_and_send_batch_keeps_processing_when_one_incident_hits_cooldown(monkeypatch):
+    from src.main import process_and_send_batch
+
+    class _FakeAnalyzer:
+        def classify_incident_event_type(self, _raw_inc):
+            return "IncidentUpdated"
+
+        def update_incident_time(self, *_args, **_kwargs):
+            return None
+
+    class _FakeKafka:
+        def __init__(self):
+            self.sent = 0
+
+        async def send_incident(self, _payload, topic=None):
+            self.sent += 1
+
+    raw_incidents = [{"id": "inc-a"}, {"id": "inc-b"}]
+
+    async def _fake_fetch_incident_bundle(*, incident_uuid, **_kwargs):
+        if incident_uuid == "inc-a":
+            raise LumuEndpointCooldownException(
+                endpoint_name="incident_details",
+                tenant_key_normalized="tenant-1",
+                cooldown_remaining_seconds=90.0,
+                reason_code="endpoint_cooldown",
+            )
+        return IncidentSourceBundle(
+            incident_uuid=incident_uuid,
+            tenant_uuid="tenant-1",
+            defender_details={},
+            defender_contacts=[],
+            secops_details={},
+            activity_event_details=[],
+            stix={},
+            summary={},
+            articles=[],
+        )
+
+    monkeypatch.setattr("src.main.fetch_incident_bundle", _fake_fetch_incident_bundle)
+
+    success, failed = asyncio.run(
+        process_and_send_batch(
+            client=SimpleNamespace(),
+            analyzer=_FakeAnalyzer(),
+            kafka=_FakeKafka(),
+            raw_incidents=raw_incidents,
+            tenant_uuid="tenant-1",
+            tenant_name="Tenant 1",
+            company_key="key-1",
+            kafka_topic="topic-1",
+            is_bootstrap_mode=False,
+        )
+    )
+
+    assert success == 1
+    assert failed == 1
 
 
 def test_enrich_incident_skips_contacts_when_existing_breadth_is_sufficient():

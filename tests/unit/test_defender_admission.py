@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from src.lumu_client import LumuSession
+from src.lumu_client import LumuSession, LumuEndpointCooldownException
 
 
 class _Secret:
@@ -91,10 +91,10 @@ def test_register_429_opens_journal_breaker(monkeypatch):
     now = {"value": 50.0}
     monkeypatch.setattr(session, "_now_monotonic", lambda: now["value"])
 
-    asyncio.run(session._register_defender_429("open_incidents_updates", 30.0))
-    assert session._journal_breaker_state == "closed"
-    asyncio.run(session._register_defender_429("open_incidents_updates", 30.0))
-    assert session._journal_breaker_state == "open"
+    asyncio.run(session._register_defender_429("open_incidents_updates", 30.0, "tenant-a"))
+    assert session._journal_breaker_state_by_company.get("tenant-a", "closed") == "closed"
+    asyncio.run(session._register_defender_429("open_incidents_updates", 30.0, "tenant-a"))
+    assert session._journal_breaker_state_by_company.get("tenant-a") == "open"
 
 
 def test_journal_breaker_skip_and_half_open(monkeypatch):
@@ -106,14 +106,14 @@ def test_journal_breaker_skip_and_half_open(monkeypatch):
     try:
         asyncio.run(session._admission_wait_and_reserve("open_incidents_updates", "tenant-a"))
         assert False
-    except RuntimeError as exc:
-        assert str(exc) in {"journal_circuit_open", "journal_tenant_cooldown"}
+    except LumuEndpointCooldownException as exc:
+        assert exc.reason_code in {"journal_circuit_open", "journal_tenant_cooldown"}
 
     now["value"] = 111.0
     asyncio.run(session._admission_wait_and_reserve("open_incidents_updates", "tenant-a"))
-    assert session._journal_breaker_state == "half_open"
-    asyncio.run(session._register_defender_success("open_incidents_updates"))
-    assert session._journal_breaker_state == "closed"
+    assert session._journal_breaker_state_by_company.get("tenant-a") == "half_open"
+    asyncio.run(session._register_defender_success("open_incidents_updates", "tenant-a"))
+    assert session._journal_breaker_state_by_company.get("tenant-a") == "closed"
 
 
 def test_journal_cooldown_is_tenant_scoped(monkeypatch):
@@ -125,7 +125,7 @@ def test_journal_cooldown_is_tenant_scoped(monkeypatch):
     try:
         asyncio.run(session._admission_wait_and_reserve("open_incidents_updates", "tenant-a-key"))
         assert False
-    except RuntimeError as exc:
-        assert str(exc) == "journal_tenant_cooldown"
+    except LumuEndpointCooldownException as exc:
+        assert exc.reason_code == "journal_tenant_cooldown"
 
     asyncio.run(session._admission_wait_and_reserve("open_incidents_updates", "tenant-b-key"))

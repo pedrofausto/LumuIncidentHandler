@@ -26,6 +26,8 @@ class RatePolicy:
     initial_backoff: float
     defender_max_items_param: int
     defender_use_max_items_param: bool
+    non_journal_max_blocking_cooldown_seconds: float
+    details_per_tenant_concurrency: int
 
 
 PROFILE_DEFAULTS = {
@@ -52,6 +54,8 @@ PROFILE_DEFAULTS = {
         initial_backoff=2.0,
         defender_max_items_param=500,
         defender_use_max_items_param=True,
+        non_journal_max_blocking_cooldown_seconds=5.0,
+        details_per_tenant_concurrency=1,
     ),
     "balanced": RatePolicy(
         profile="balanced",
@@ -76,6 +80,8 @@ PROFILE_DEFAULTS = {
         initial_backoff=2.0,
         defender_max_items_param=500,
         defender_use_max_items_param=True,
+        non_journal_max_blocking_cooldown_seconds=10.0,
+        details_per_tenant_concurrency=1,
     ),
     "aggressive": RatePolicy(
         profile="aggressive",
@@ -100,6 +106,8 @@ PROFILE_DEFAULTS = {
         initial_backoff=1.5,
         defender_max_items_param=500,
         defender_use_max_items_param=True,
+        non_journal_max_blocking_cooldown_seconds=15.0,
+        details_per_tenant_concurrency=2,
     ),
 }
 
@@ -150,6 +158,8 @@ def resolve_rate_policy_from_settings(settings_obj):
         "initial_backoff": "lumu_initial_backoff",
         "defender_max_items_param": "lumu_defender_max_items_param",
         "defender_use_max_items_param": "lumu_defender_use_max_items_param",
+        "non_journal_max_blocking_cooldown_seconds": "lumu_non_journal_max_blocking_cooldown_seconds",
+        "details_per_tenant_concurrency": "lumu_details_per_tenant_concurrency",
     }
     expert_values = {}
     for policy_key, settings_key in expert_keys.items():
