@@ -82,9 +82,9 @@ def serialize_incident_event(
     affected_endpoints = event_dict.get("affected_endpoints") or []
     lumu_payload = {
         "id": event_dict.get("incident_uuid", ""),
-        "adversaries": event_dict.get("title", ""),
-        "adversary_id": event_dict.get("adversary_id", ""),
-        "adversary_types": event_dict.get("adversary_type", ""),
+        "malicious_destination": event_dict.get("title", ""),
+        "malicious_destination_id": event_dict.get("adversary_id", ""),
+        "malicious_destination_types": event_dict.get("adversary_type", ""),
         "company_id": event_dict.get("customer_uuid") or tenant_uuid,
         "customer_name": event_dict.get("customer_name") or tenant_name,
         "endpoints_affected": event_dict.get("endpoints_affected", 0),

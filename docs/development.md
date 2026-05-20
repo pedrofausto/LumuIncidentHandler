@@ -136,7 +136,7 @@ Kafka messages keep the outer wrapper:
 }
 ```
 
-Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. The payload also includes activity enrichments under `data.lumu.activity_incident_details` and `data.lumu.endpoint_context`, with endpoint context sourced from managed event details and any concrete Defender contact/detail rows. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
+Inside the stringified payload, Lumu-specific fields are grouped under `data.lumu`, affected endpoints use `srchost` and `srcip`, and the emitted payload includes top-level `agent`, `rule`, `decoder`, and `manager`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; incidents not already present in local state default to `NewIncidentCreated`. The payload uses `malicious_destination`, `malicious_destination_id`, and `malicious_destination_types` for the destination identity fields. The payload also includes activity enrichments under `data.lumu.activity_incident_details` and `data.lumu.endpoint_context`, with endpoint context sourced from managed event details, supplemental `contacts/range` resolver-side records, and any concrete Defender contact/detail rows. Top-level `integration`, `severity`, `event_type`, `ss_groups`, and `ss_customer` are not emitted.
 
 ### Rate-Control Behavior
 

@@ -200,6 +200,13 @@ def _merge_context_dicts(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict
         existing = merged[key]
         if isinstance(existing, dict) and isinstance(value, dict):
             merged[key] = _merge_context_dicts(existing, value)
+            if key == "telemetry":
+                base_only_keys = {"source_type", "source_id", "label", "from_playback"}
+                incoming_signal_keys = set(value.keys()) - base_only_keys
+                if incoming_signal_keys:
+                    for source_key in ("source_type", "source_id", "label", "from_playback"):
+                        if source_key in value and value.get(source_key) not in (None, "", [], {}):
+                            merged[key][source_key] = value[source_key]
         elif isinstance(existing, list) and isinstance(value, list):
             merged[key] = existing + [item for item in value if item not in existing]
         elif existing in (None, "", [], {}):
@@ -346,14 +353,30 @@ def _event_detail_to_endpoint_context(event_detail: Dict[str, Any], incident_sev
     dns_info = source_data.get("DNSPacketExtraInfo") if isinstance(source_data.get("DNSPacketExtraInfo"), dict) else {}
     if dns_info:
         question = dns_info.get("question") if isinstance(dns_info.get("question"), dict) else {}
+        answers = dns_info.get("answers", []) if isinstance(dns_info.get("answers"), list) else []
+        flags = dns_info.get("flags") if isinstance(dns_info.get("flags"), dict) else {}
         network_data = _compact_structure(
             {
                 "dns_question_name": question.get("name") or event_detail.get("host"),
                 "dns_question_type": question.get("type"),
                 "dns_question_class": question.get("class"),
                 "dns_response_code": dns_info.get("responseCode"),
-                "dns_answer_count": len(dns_info.get("answers", [])) if isinstance(dns_info.get("answers"), list) else None,
+                "dns_answer_count": len(answers) if answers else None,
                 "dns_op_code": dns_info.get("opCode"),
+                "dns_flags": flags,
+                "dns_answers": [
+                    _compact_structure(
+                        {
+                            "name": answer.get("name"),
+                            "type": answer.get("type"),
+                            "class": answer.get("class"),
+                            "ttl": answer.get("ttl"),
+                            "data": answer.get("data"),
+                        }
+                    )
+                    for answer in answers
+                    if isinstance(answer, dict)
+                ],
             }
         )
         if network_data:
@@ -494,6 +517,30 @@ def build_incident_event(
                     threat_detail=ioc.get("threat_detail", ""),
                 )
             )
+    resolved_ips = list(related_artifacts.get("resolved_ips", [])) if isinstance(related_artifacts.get("resolved_ips"), list) else []
+    dns_https_records = list(related_artifacts.get("dns_https_records", [])) if isinstance(related_artifacts.get("dns_https_records"), list) else []
+    for records in (bundle.endpoint_contacts_range or {}).values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            source_data = record.get("sourceData") if isinstance(record.get("sourceData"), dict) else {}
+            dns_info = source_data.get("DNSPacketExtraInfo") if isinstance(source_data.get("DNSPacketExtraInfo"), dict) else {}
+            answers = dns_info.get("answers", []) if isinstance(dns_info.get("answers"), list) else []
+            for answer in answers:
+                if not isinstance(answer, dict):
+                    continue
+                answer_type = str(answer.get("type") or "").upper()
+                answer_data = answer.get("data")
+                if answer_type == "A" and isinstance(answer_data, str) and answer_data not in resolved_ips:
+                    resolved_ips.append(answer_data)
+                if answer_type == "HTTPS" and isinstance(answer_data, str) and answer_data not in dns_https_records:
+                    dns_https_records.append(answer_data)
+    if resolved_ips:
+        related_artifacts["resolved_ips"] = resolved_ips
+    if dns_https_records:
+        related_artifacts["dns_https_records"] = dns_https_records
 
     intelligence_articles: List[ThreatIntelArticle] = []
     for art in bundle.articles or []:
@@ -523,6 +570,10 @@ def build_incident_event(
                     "endpointName": target.get("name") or target.get("endpoint_name"),
                 }
             )
+    endpoint_contacts_range_sources: List[List[Dict[str, Any]]] = []
+    for records in (bundle.endpoint_contacts_range or {}).values():
+        if isinstance(records, list) and records:
+            endpoint_contacts_range_sources.append(records)
 
     sources = [
         api_contacts_list if isinstance(api_contacts_list, list) else [],
@@ -530,6 +581,7 @@ def build_incident_event(
         [first_contact_details] if first_contact_details else [],
         [last_contact_details] if last_contact_details else [],
         secops_targets,
+        *endpoint_contacts_range_sources,
     ]
     endpoint_breadth_sources: List[str] = []
     if api_contacts_list:
@@ -542,6 +594,8 @@ def build_incident_event(
         endpoint_breadth_sources.append("lastContactDetails")
     if secops_targets:
         endpoint_breadth_sources.append("secops_targetsSamples")
+    if endpoint_contacts_range_sources:
+        endpoint_breadth_sources.append("managed_contacts_range")
     logger.debug(
         "Endpoint breadth sources incident=%s sources=%s",
         uuid,
@@ -591,6 +645,9 @@ def build_incident_event(
         context_sources.append(last_contact_details)
     if isinstance(bundle.activity_event_details, list):
         context_sources.extend(event_detail for event_detail in bundle.activity_event_details if isinstance(event_detail, dict))
+    for records in (bundle.endpoint_contacts_range or {}).values():
+        if isinstance(records, list):
+            context_sources.extend(row for row in records if isinstance(row, dict))
     endpoint_context = _build_endpoint_context(context_sources, severity)
     if not endpoints_count:
         endpoints_count = len(affected_endpoints)

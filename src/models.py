@@ -107,6 +107,7 @@ class IncidentSourceBundle:
     defender_contacts: List[Dict[str, Any]] = field(default_factory=list)
     secops_details: Dict[str, Any] = field(default_factory=dict)
     activity_event_details: List[Dict[str, Any]] = field(default_factory=list)
+    endpoint_contacts_range: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     stix: Dict[str, Any] = field(default_factory=dict)
     summary: Dict[str, Any] = field(default_factory=dict)
     articles: List[Dict[str, Any]] = field(default_factory=list)

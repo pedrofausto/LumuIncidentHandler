@@ -10,6 +10,7 @@ The runtime applies a fixed source hierarchy:
 - Defender `details` for incident-level detail and actions
 - Managed `secops-incidents` for endpoint breadth and activity event references
 - Managed `activity/incidents/{event_uuid}/details` for per-endpoint telemetry/context
+- Managed `activity/label/{label}/endpoint/{endpoint_ip}/contacts/range` for supplemental resolver-side DNS context
 - Defender `contacts` only as fallback when breadth or context is still incomplete
 
 ### 1. Authentication & STIX (Managed API)
@@ -73,9 +74,9 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity,
   "data": {
     "lumu": {
       "id": "incident-uuid",
-      "adversaries": "threat title",
-      "adversary_id": "indicator-or-adversary-id",
-      "adversary_types": "Malware",
+      "malicious_destination": "threat title",
+      "malicious_destination_id": "indicator-or-adversary-id",
+      "malicious_destination_types": "Malware",
       "company_id": "customer-uuid",
       "customer_name": "Customer Name",
       "endpoints_affected": 8,
@@ -139,7 +140,7 @@ The pre-stringify payload is reshaped before publishing. Lumu-specific identity,
 ```
 
 Rule level mapping is `Low="3"`, `Medium="8"`, `High="16"`, with unknown values defaulting to `"8"`. `data.lumu.event_type` is normalized to `NewIncidentCreated` or `IncidentUpdated`; new incidents default to `NewIncidentCreated` when they are not already present in local state. When `EVENT_TYPE_TEST_MODE=true`, `data.lumu.event_type` is forced to `"test"` for debugging. The `integration`, top-level `severity`, top-level `event_type`, `ss_groups`, and `ss_customer` fields are not emitted.
-`data.lumu.endpoint_context` is emitted only when concrete per-endpoint context exists. Null-only placeholder entries are not emitted. `users` and `emails` are emitted only inside `endpoint_context` and are not duplicated into `affected_endpoints`. Telemetry severity is emitted only when it matches normalized incident severity.
+`data.lumu.endpoint_context` is emitted only when concrete per-endpoint context exists. Null-only placeholder entries are not emitted. `users` and `emails` are emitted only inside `endpoint_context` and are not duplicated into `affected_endpoints`. Telemetry severity is emitted only when it matches normalized incident severity. DNS-oriented endpoint context may also include `network.dns_flags` and `network.dns_answers` when resolver-side contacts are available from `contacts/range`.
 
 ---
 
@@ -150,7 +151,9 @@ All raw data is normalized into the `IncidentEvent` model.
 | Category | Field | Source | Description |
 |---|---|---|---|
 | **Identity** | `data.lumu.id` | Defender API | Unique Lumu identifier. |
-| | `data.lumu.adversaries` | Defender API | Human-readable threat name. |
+| | `data.lumu.malicious_destination` | Defender API | Human-readable malicious destination name. |
+| | `data.lumu.malicious_destination_id` | Defender API | Malicious destination identifier as provided by incident metadata. |
+| | `data.lumu.malicious_destination_types` | Defender API | Malicious destination classification, such as `Malware`. |
 | **Status** | `severity` | Defender API | Threat level (High/Medium/Low). |
 | | `data.lumu.status` | Defender API | Lifecycle status (open/closed). |
 | | `data.lumu.event_type` | Internal/Lumu Journal | Normalized event type: `NewIncidentCreated` or `IncidentUpdated`. |
@@ -163,7 +166,7 @@ All raw data is normalized into the `IncidentEvent` model.
 | | `data.lumu.stix_indicators` | STIX Bundle | Patterns and IOCs from the STIX bundle. |
 | | `data.lumu.tlp` | STIX Bundle | Traffic Light Protocol level. |
 | **Activity Context** | `data.lumu.activity_incident_details` | Managed API | Per-incident managed secops summary including offender and target samples. |
-| | `data.lumu.endpoint_context` | Managed + Defender APIs | Per-endpoint users/emails/OS plus merged HTTP, network, and telemetry context from managed event details and concrete Defender contact/detail rows. |
+| | `data.lumu.endpoint_context` | Managed + Defender APIs | Per-endpoint users/emails/OS plus merged HTTP, network, DNS answer/flag, and telemetry context from managed event details, `contacts/range`, and concrete Defender contact/detail rows. |
 | **Response** | `data.lumu.recommended_playbooks`| Context API | Suggested SOPs for remediation. |
 | | `data.lumu.triggered_integrations`| Defender Details| Third-party tools already notified by Lumu. |
 | | `data.lumu.disseminated`| Defender Details| Whether an automated response action was observed. |

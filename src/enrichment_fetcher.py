@@ -1,8 +1,10 @@
 import asyncio
 import logging
+from datetime import timedelta, timezone
 from typing import Any, Dict, List
 
 import httpx
+from dateutil import parser
 
 from .lumu_client import LumuSession, LumuEndpointCooldownException
 from .models import IncidentSourceBundle
@@ -151,6 +153,117 @@ def _collect_activity_event_ids(secops_details: Dict[str, Any]) -> List[str]:
     return event_ids
 
 
+def _parse_datetime(value: Any):
+    if not value:
+        return None
+    try:
+        parsed = parser.parse(str(value))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _collect_incident_hosts(details: Dict[str, Any], secops_details: Dict[str, Any]) -> set[str]:
+    hosts: set[str] = set()
+
+    def add_host(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            hosts.add(value.strip().lower())
+
+    add_host(details.get("host"))
+    for key in ("firstContactDetails", "lastContactDetails"):
+        row = details.get(key)
+        if isinstance(row, dict):
+            add_host(row.get("host"))
+    if isinstance(secops_details, dict):
+        for offender in secops_details.get("offendersSamples", []) or []:
+            if isinstance(offender, dict):
+                add_host(offender.get("value") or offender.get("_id") or offender.get("name"))
+    return hosts
+
+
+def _collect_incident_details_text(details: Dict[str, Any], secops_details: Dict[str, Any]) -> set[str]:
+    texts: set[str] = set()
+
+    def add_text(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            texts.add(value.strip().lower())
+        elif isinstance(value, list):
+            for item in value:
+                add_text(item)
+
+    add_text(details.get("details"))
+    for key in ("firstContactDetails", "lastContactDetails"):
+        row = details.get(key)
+        if isinstance(row, dict):
+            add_text(row.get("details"))
+    if isinstance(secops_details, dict):
+        add_text(secops_details.get("description"))
+    return texts
+
+
+def _collect_incident_types(details: Dict[str, Any], secops_details: Dict[str, Any]) -> set[str]:
+    types: set[str] = set()
+
+    def add_type(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            types.add(value.strip().lower())
+        elif isinstance(value, list):
+            for item in value:
+                add_type(item)
+
+    add_type(details.get("types"))
+    for key in ("firstContactDetails", "lastContactDetails"):
+        row = details.get(key)
+        if isinstance(row, dict):
+            add_type(row.get("types"))
+    if isinstance(secops_details, dict):
+        add_type(secops_details.get("adversaryTypes"))
+    return types
+
+
+def _record_matches_incident(
+    record: Dict[str, Any],
+    endpoint_ip: str,
+    incident_hosts: set[str],
+    incident_detail_texts: set[str],
+    incident_types: set[str],
+    incident_time,
+) -> bool:
+    if not isinstance(record, dict):
+        return False
+    candidate_endpoint_ip = str(record.get("endpointIp") or record.get("endpoint_ip") or "").strip()
+    if candidate_endpoint_ip != endpoint_ip:
+        return False
+
+    host = str(record.get("host") or "").strip().lower()
+    detail_values = {
+        str(value).strip().lower()
+        for value in (record.get("details") or [])
+        if isinstance(value, str) and value.strip()
+    }
+    type_values = {
+        str(value).strip().lower()
+        for value in (record.get("types") or [])
+        if isinstance(value, str) and value.strip()
+    }
+
+    host_match = bool(host and host in incident_hosts)
+    detail_match = bool(detail_values and detail_values.intersection(incident_detail_texts))
+    type_match = bool(type_values and type_values.intersection(incident_types))
+
+    if not (host_match or detail_match or type_match):
+        return False
+
+    record_dt = _parse_datetime(record.get("datetime"))
+    if incident_time and record_dt:
+        if abs(record_dt - incident_time) > timedelta(days=1):
+            return False
+    return True
+
+
 async def fetch_incident_bundle(
     client: LumuSession,
     tenant_uuid: str,
@@ -235,6 +348,81 @@ async def fetch_incident_bundle(
             except Exception as exc:
                 logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
 
+        endpoint_contacts_range: Dict[str, List[Dict[str, Any]]] = {}
+        details_dict = details if isinstance(details, dict) else {}
+        secops_dict = secops_details if isinstance(secops_details, dict) else {}
+        incident_hosts = _collect_incident_hosts(details_dict, secops_dict)
+        incident_detail_texts = _collect_incident_details_text(details_dict, secops_dict)
+        incident_types = _collect_incident_types(details_dict, secops_dict)
+        incident_time = _parse_datetime(
+            secops_dict.get("timestamp") or details_dict.get("datetime")
+        )
+        target_samples = secops_dict.get("targetsSamples", []) if isinstance(secops_dict.get("targetsSamples", []), list) else []
+        for target in target_samples:
+            if not isinstance(target, dict):
+                continue
+            endpoint_ip = str(target.get("endpoint_ip") or target.get("endpointIp") or "").strip()
+            if not endpoint_ip:
+                continue
+            try:
+                logger.debug(
+                    "Querying contacts/range tenant=%s incident=%s endpoint_ip=%s",
+                    tenant_uuid,
+                    incident_uuid,
+                    endpoint_ip,
+                )
+                contacts_range = await client.get_endpoint_contacts_range(
+                    tenant_uuid,
+                    endpoint_ip,
+                    label=str(target.get("label") or target.get("environment") or "0"),
+                    items=5,
+                    page=1,
+                )
+                contacts_range_rows = contacts_range.get("contacts", []) if isinstance(contacts_range, dict) else []
+                accepted_rows = [
+                    row for row in contacts_range_rows
+                    if _record_matches_incident(
+                        row,
+                        endpoint_ip,
+                        incident_hosts,
+                        incident_detail_texts,
+                        incident_types,
+                        incident_time,
+                    )
+                ]
+                if accepted_rows:
+                    endpoint_contacts_range[endpoint_ip] = accepted_rows
+                logger.debug(
+                    "contacts/range correlation tenant=%s incident=%s endpoint_ip=%s accepted=%s discarded=%s",
+                    tenant_uuid,
+                    incident_uuid,
+                    endpoint_ip,
+                    len(accepted_rows),
+                    max(0, len(contacts_range_rows) - len(accepted_rows)),
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    logger.info(
+                        "contacts/range unavailable tenant=%s incident=%s endpoint_ip=%s status=404",
+                        tenant_uuid,
+                        incident_uuid,
+                        endpoint_ip,
+                    )
+                else:
+                    logger.warning(
+                        "contacts/range enrichment failed incident=%s endpoint_ip=%s reason=%s",
+                        incident_uuid,
+                        endpoint_ip,
+                        exc,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "contacts/range enrichment failed incident=%s endpoint_ip=%s reason=%s",
+                    incident_uuid,
+                    endpoint_ip,
+                    exc,
+                )
+
         activity_event_details: List[Dict[str, Any]] = []
         event_ids = _collect_activity_event_ids(secops_details)
         if not event_ids:
@@ -284,6 +472,7 @@ async def fetch_incident_bundle(
             defender_contacts=contacts if isinstance(contacts, list) else [],
             secops_details=secops_details if isinstance(secops_details, dict) else {},
             activity_event_details=activity_event_details,
+            endpoint_contacts_range=endpoint_contacts_range,
             stix=stix if isinstance(stix, dict) else {},
             summary=summary if isinstance(summary, dict) else {},
             articles=articles if isinstance(articles, list) else [],

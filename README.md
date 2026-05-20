@@ -5,7 +5,7 @@ An automated monitor and alert system for the Lumu security platform. It polls f
 ## Features
 
 - **Automated Polling**: Regularly checks for new incidents across multiple tenants.
-- **Rich Enrichment**: Merges raw incident data with STIX 2.1 objects (Indicators, Malware, Sightings) and managed activity endpoint/user context.
+- **Rich Enrichment**: Merges raw incident data with STIX 2.1 objects (Indicators, Malware, Sightings), managed activity endpoint/user context, and resolver-side DNS context from managed `contacts/range` data when available.
 - **Explicit Pipeline Stages**: Separates source fetching, incident building, payload serialization, and state tracking into dedicated modules.
 - **Journal-First Polling**: Uses the Defender journal as the hot path and schedules full open-state reconciliation instead of sweeping `/api/incidents/all` every cycle.
 - **Tenant Scheduler Smoothing**: Applies per-tenant cycle jitter and a global tenant concurrency cap to reduce synchronized Defender API bursts.

@@ -884,6 +884,30 @@ class LumuSession:
         endpoint = f"/data-api/companies/{company_uuid}/activity/incidents/{event_uuid}/details"
         return await self.get_with_auth(endpoint)
 
+    async def get_endpoint_contacts_range(
+        self,
+        company_uuid: str,
+        endpoint_ip: str,
+        label: str = "0",
+        items: int = 5,
+        page: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Fetch managed endpoint contacts/range details for a specific endpoint.
+        Endpoint: GET /data-api/companies/{company_uuid}/activity/label/{label}/endpoint/{endpoint_ip}/contacts/range
+        """
+        endpoint = f"/data-api/companies/{company_uuid}/activity/label/{label}/endpoint/{endpoint_ip}/contacts/range"
+        data = await self.get_with_auth(endpoint, params={"items": items, "page": page})
+        if isinstance(data, dict):
+            contacts = data.get("contacts")
+            return {
+                "paginationInfo": data.get("paginationInfo", {}),
+                "contacts": contacts if isinstance(contacts, list) else [],
+            }
+        if isinstance(data, list):
+            return {"paginationInfo": {}, "contacts": data}
+        return {"paginationInfo": {}, "contacts": []}
+
     async def close(self):
         await self.client.aclose()
 
