@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import timedelta, timezone
+from urllib.parse import urlparse
 from typing import Any, Dict, List
 
 import httpx
@@ -26,6 +27,112 @@ def _coerce_count(value: Any) -> int:
         return coerced if coerced > 0 else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_endpoint_identity(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _build_contact_identity_digest(*sources: Any) -> tuple[str, int]:
+    identities: set[str] = set()
+    for source in sources:
+        if isinstance(source, list):
+            rows = source
+        elif isinstance(source, dict):
+            rows = [source]
+        else:
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for candidate in (
+                row.get("endpointIp"),
+                row.get("endpoint_ip"),
+                row.get("ip"),
+                row.get("ipAddress"),
+                row.get("srcip"),
+                row.get("endpointName"),
+                row.get("name"),
+                row.get("host"),
+            ):
+                normalized = _normalize_endpoint_identity(candidate)
+                if normalized:
+                    identities.add(normalized)
+                    break
+    return ("|".join(sorted(identities)), len(identities))
+
+
+def _normalize_defender_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    related_artifacts: Dict[str, List[str]] = {}
+    for key in ("sha256", "sha1", "md5"):
+        value = context.get(key)
+        if isinstance(value, list):
+            cleaned = [item for item in value if isinstance(item, str) and item.strip()]
+            if cleaned:
+                related_artifacts[key] = cleaned
+        elif isinstance(value, str) and value.strip():
+            related_artifacts[key] = [value.strip()]
+
+    playbooks = []
+    for playbook_url in context.get("playbooks", []) or []:
+        if isinstance(playbook_url, str) and playbook_url.strip():
+            playbooks.append(
+                {
+                    "name": playbook_url.rstrip("/").split("/")[-1] or "playbook",
+                    "description": "",
+                    "url": playbook_url,
+                }
+            )
+
+    iocs = []
+    for trigger in context.get("threat_triggers", []) or []:
+        if not isinstance(trigger, str) or not trigger.strip():
+            continue
+        parsed = urlparse(trigger)
+        parsed_domain = parsed.hostname or trigger.replace("http://", "").replace("https://", "").split("/")[0]
+        iocs.append(
+            {
+                "parsed_domain": parsed_domain,
+                "url": trigger,
+                "feed_name": "defender_context",
+                "threat_detail": "; ".join(
+                    item for item in context.get("threat_details", []) or [] if isinstance(item, str) and item.strip()
+                ),
+            }
+        )
+
+    mitre_details = []
+    mitre = context.get("mitre", {})
+    if isinstance(mitre, dict):
+        for detail in mitre.get("details", []) or []:
+            if not isinstance(detail, dict):
+                continue
+            technique = str(detail.get("technique") or detail.get("id") or "").strip()
+            tactic = str(detail.get("tactic") or "").strip()
+            if technique or tactic:
+                mitre_details.append(
+                    {
+                        "technique": technique or tactic,
+                        "description": "",
+                        "tactics": [tactic] if tactic else [],
+                        "platforms": [],
+                        "references": [],
+                    }
+                )
+
+    return {
+        "additional": {
+            "mitre": mitre_details,
+            "related_artifacts": related_artifacts,
+            "tags": [item for item in context.get("threat_details", []) or [] if isinstance(item, str) and item.strip()],
+        },
+        "playbooks": playbooks,
+        "iocs": iocs,
+    }
 
 
 def _collect_endpoint_ids_from_details(details: Dict[str, Any], secops_details: Dict[str, Any]) -> set[str]:
@@ -270,63 +377,71 @@ async def fetch_incident_bundle(
     defender_key: str,
     incident_uuid: str,
     is_bootstrap_mode: bool = False,
+    mode: str = "new",
+    stored_contact_digest: str = "",
 ) -> IncidentSourceBundle:
     try:
         details_task = client.get_incident_details(defender_key, incident_uuid)
-        stix_task = client.get_incident_stix(tenant_uuid, incident_uuid)
-        summary_task = client.get_incident_context_summary(tenant_uuid, incident_uuid)
-        secops_details_task = client.get_secops_incident_details(tenant_uuid, incident_uuid)
+        context_task = client.get_incident_context(defender_key, incident_uuid)
 
-        articles_task = None
-        if not is_bootstrap_mode:
-            articles_task = client.get_incident_external_articles(tenant_uuid, incident_uuid)
+        stix_task = None
+        summary_task = None
+        secops_details_task = None
+        if mode == "new":
+            stix_task = client.get_incident_stix(tenant_uuid, incident_uuid)
+            summary_task = client.get_incident_context_summary(tenant_uuid, incident_uuid)
+            secops_details_task = client.get_secops_incident_details(tenant_uuid, incident_uuid)
 
-        stix = await _safe_enrichment("STIX", incident_uuid, stix_task, {})
-        await asyncio.sleep(0.5)
         details = await _safe_enrichment("details", incident_uuid, details_task, {})
         await asyncio.sleep(0.5)
-        summary = await _safe_enrichment("summary", incident_uuid, summary_task, {})
-        await asyncio.sleep(0.5)
-        secops_details = await _safe_enrichment("secops details", incident_uuid, secops_details_task, {})
+        defender_context = await _safe_enrichment("defender context", incident_uuid, context_task, {})
+
+        stix: Dict[str, Any] = {}
+        summary: Dict[str, Any] = {}
+        secops_details: Dict[str, Any] = {}
+        if mode == "new":
+            await asyncio.sleep(0.5)
+            stix = await _safe_enrichment("STIX", incident_uuid, stix_task, {})
+            await asyncio.sleep(0.5)
+            summary = await _safe_enrichment("summary", incident_uuid, summary_task, {})
+            await asyncio.sleep(0.5)
+            secops_details = await _safe_enrichment("secops details", incident_uuid, secops_details_task, {})
+
+            if not summary or not summary.get("additional"):
+                summary = _normalize_defender_context(defender_context)
+        else:
+            summary = _normalize_defender_context(defender_context)
 
         contacts: List[Dict[str, Any]] = []
         detail_contacts = details.get("contacts") if isinstance(details, dict) else None
         detail_contacts_list = detail_contacts if isinstance(detail_contacts, list) else []
-        if detail_contacts_list:
-            logger.debug(
-                "Endpoint breadth source tenant=%s incident=%s source=defender_details contacts=%s",
-                tenant_uuid,
-                incident_uuid,
-                len(detail_contacts_list),
-            )
-        expected_endpoints = _extract_expected_endpoint_count(details, secops_details)
-        known_endpoint_ids = _collect_endpoint_ids_from_details(details, secops_details)
-        contextual_endpoint_ids = _collect_contextual_endpoint_ids(details)
-        has_sufficient_breadth = expected_endpoints > 0 and len(known_endpoint_ids) >= expected_endpoints
-        has_sufficient_context = expected_endpoints > 0 and len(contextual_endpoint_ids) >= expected_endpoints
-        should_fetch_contacts = (
-            not detail_contacts_list
-            or not has_sufficient_breadth
-            or not has_sufficient_context
+        detail_contact_digest, detail_endpoint_count = _build_contact_identity_digest(
+            detail_contacts_list,
+            details.get("firstContactDetails") if isinstance(details, dict) else {},
+            details.get("lastContactDetails") if isinstance(details, dict) else {},
         )
-        if has_sufficient_breadth:
-            logger.debug(
-                "Defender details breadth tenant=%s incident=%s known=%s expected=%s contextual=%s",
-                tenant_uuid,
-                incident_uuid,
-                len(known_endpoint_ids),
-                expected_endpoints,
-                len(contextual_endpoint_ids),
+
+        if mode == "new":
+            expected_endpoints = _extract_expected_endpoint_count(details, secops_details)
+            known_endpoint_ids = _collect_endpoint_ids_from_details(details, secops_details)
+            contextual_endpoint_ids = _collect_contextual_endpoint_ids(details)
+            has_sufficient_breadth = expected_endpoints > 0 and len(known_endpoint_ids) >= expected_endpoints
+            has_sufficient_context = expected_endpoints > 0 and len(contextual_endpoint_ids) >= expected_endpoints
+            should_fetch_contacts = (
+                not detail_contacts_list
+                or not has_sufficient_breadth
+                or not has_sufficient_context
             )
+        else:
+            should_fetch_contacts = (
+                stored_contact_digest
+                and detail_contact_digest
+                and detail_contact_digest != stored_contact_digest
+            )
+
         if should_fetch_contacts:
             try:
                 contacts = await client.get_incident_contacts(defender_key, incident_uuid)
-                logger.debug(
-                    "Endpoint breadth source tenant=%s incident=%s source=defender_contacts contacts=%s",
-                    tenant_uuid,
-                    incident_uuid,
-                    len(contacts),
-                )
             except httpx.HTTPStatusError as exc:
                 if exc.response is not None and exc.response.status_code == 404:
                     logger.info(
@@ -348,127 +463,133 @@ async def fetch_incident_bundle(
             except Exception as exc:
                 logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
 
-        endpoint_contacts_range: Dict[str, List[Dict[str, Any]]] = {}
-        details_dict = details if isinstance(details, dict) else {}
-        secops_dict = secops_details if isinstance(secops_details, dict) else {}
-        incident_hosts = _collect_incident_hosts(details_dict, secops_dict)
-        incident_detail_texts = _collect_incident_details_text(details_dict, secops_dict)
-        incident_types = _collect_incident_types(details_dict, secops_dict)
-        incident_time = _parse_datetime(
-            secops_dict.get("timestamp") or details_dict.get("datetime")
+        merged_digest, observed_endpoint_count = _build_contact_identity_digest(
+            detail_contacts_list,
+            contacts,
+            details.get("firstContactDetails") if isinstance(details, dict) else {},
+            details.get("lastContactDetails") if isinstance(details, dict) else {},
         )
-        target_samples = secops_dict.get("targetsSamples", []) if isinstance(secops_dict.get("targetsSamples", []), list) else []
-        for target in target_samples:
-            if not isinstance(target, dict):
-                continue
-            endpoint_ip = str(target.get("endpoint_ip") or target.get("endpointIp") or "").strip()
-            if not endpoint_ip:
-                continue
-            try:
-                logger.debug(
-                    "Querying contacts/range tenant=%s incident=%s endpoint_ip=%s",
-                    tenant_uuid,
-                    incident_uuid,
-                    endpoint_ip,
-                )
-                contacts_range = await client.get_endpoint_contacts_range(
-                    tenant_uuid,
-                    endpoint_ip,
-                    label=str(target.get("label") or target.get("environment") or "0"),
-                    items=5,
-                    page=1,
-                )
-                contacts_range_rows = contacts_range.get("contacts", []) if isinstance(contacts_range, dict) else []
-                accepted_rows = [
-                    row for row in contacts_range_rows
-                    if _record_matches_incident(
-                        row,
-                        endpoint_ip,
-                        incident_hosts,
-                        incident_detail_texts,
-                        incident_types,
-                        incident_time,
-                    )
-                ]
-                if accepted_rows:
-                    endpoint_contacts_range[endpoint_ip] = accepted_rows
-                logger.debug(
-                    "contacts/range correlation tenant=%s incident=%s endpoint_ip=%s accepted=%s discarded=%s",
-                    tenant_uuid,
-                    incident_uuid,
-                    endpoint_ip,
-                    len(accepted_rows),
-                    max(0, len(contacts_range_rows) - len(accepted_rows)),
-                )
-            except httpx.HTTPStatusError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    logger.info(
-                        "contacts/range unavailable tenant=%s incident=%s endpoint_ip=%s status=404",
+
+        activity_event_details: List[Dict[str, Any]] = []
+        endpoint_contacts_range: Dict[str, List[Dict[str, Any]]] = {}
+        articles: List[Dict[str, Any]] = []
+
+        if mode == "new":
+            details_dict = details if isinstance(details, dict) else {}
+            secops_dict = secops_details if isinstance(secops_details, dict) else {}
+            incident_hosts = _collect_incident_hosts(details_dict, secops_dict)
+            incident_detail_texts = _collect_incident_details_text(details_dict, secops_dict)
+            incident_types = _collect_incident_types(details_dict, secops_dict)
+            incident_time = _parse_datetime(
+                secops_dict.get("timestamp") or details_dict.get("datetime")
+            )
+            target_samples = secops_dict.get("targetsSamples", []) if isinstance(secops_dict.get("targetsSamples", []), list) else []
+            for target in target_samples:
+                if not isinstance(target, dict):
+                    continue
+                endpoint_ip = str(target.get("endpoint_ip") or target.get("endpointIp") or "").strip()
+                if not endpoint_ip:
+                    continue
+                try:
+                    logger.debug(
+                        "Querying contacts/range tenant=%s incident=%s endpoint_ip=%s",
                         tenant_uuid,
                         incident_uuid,
                         endpoint_ip,
                     )
-                else:
+                    contacts_range = await client.get_endpoint_contacts_range(
+                        tenant_uuid,
+                        endpoint_ip,
+                        label=str(target.get("label") or target.get("environment") or "0"),
+                        items=5,
+                        page=1,
+                    )
+                    contacts_range_rows = contacts_range.get("contacts", []) if isinstance(contacts_range, dict) else []
+                    accepted_rows = [
+                        row for row in contacts_range_rows
+                        if _record_matches_incident(
+                            row,
+                            endpoint_ip,
+                            incident_hosts,
+                            incident_detail_texts,
+                            incident_types,
+                            incident_time,
+                        )
+                    ]
+                    if accepted_rows:
+                        endpoint_contacts_range[endpoint_ip] = accepted_rows
+                    logger.debug(
+                        "contacts/range correlation tenant=%s incident=%s endpoint_ip=%s accepted=%s discarded=%s",
+                        tenant_uuid,
+                        incident_uuid,
+                        endpoint_ip,
+                        len(accepted_rows),
+                        max(0, len(contacts_range_rows) - len(accepted_rows)),
+                    )
+                except httpx.HTTPStatusError as exc:
+                    if exc.response is not None and exc.response.status_code == 404:
+                        logger.info(
+                            "contacts/range unavailable tenant=%s incident=%s endpoint_ip=%s status=404",
+                            tenant_uuid,
+                            incident_uuid,
+                            endpoint_ip,
+                        )
+                    else:
+                        logger.warning(
+                            "contacts/range enrichment failed incident=%s endpoint_ip=%s reason=%s",
+                            incident_uuid,
+                            endpoint_ip,
+                            exc,
+                        )
+                except Exception as exc:
                     logger.warning(
                         "contacts/range enrichment failed incident=%s endpoint_ip=%s reason=%s",
                         incident_uuid,
                         endpoint_ip,
                         exc,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "contacts/range enrichment failed incident=%s endpoint_ip=%s reason=%s",
-                    incident_uuid,
-                    endpoint_ip,
-                    exc,
-                )
 
-        activity_event_details: List[Dict[str, Any]] = []
-        event_ids = _collect_activity_event_ids(secops_details)
-        if not event_ids:
-            logger.debug(
-                "Skipping managed activity event enrichment tenant=%s incident=%s reason=no_event_ids",
-                tenant_uuid,
-                incident_uuid,
-            )
-        for event_id in event_ids:
-            await asyncio.sleep(0.5)
-            try:
-                activity_event = await client.get_activity_event_details(tenant_uuid, event_id)
-                if isinstance(activity_event, dict) and activity_event:
-                    activity_event_details.append(activity_event)
-            except httpx.HTTPStatusError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    logger.info(
-                        "managed activity event unavailable tenant=%s incident=%s event_id=%s status=404",
-                        tenant_uuid,
-                        incident_uuid,
-                        event_id,
-                    )
-                else:
+            event_ids = _collect_activity_event_ids(secops_details)
+            if not event_ids:
+                logger.debug(
+                    "Skipping managed activity event enrichment tenant=%s incident=%s reason=no_event_ids",
+                    tenant_uuid,
+                    incident_uuid,
+                )
+            for event_id in event_ids:
+                await asyncio.sleep(0.5)
+                try:
+                    activity_event = await client.get_activity_event_details(tenant_uuid, event_id)
+                    if isinstance(activity_event, dict) and activity_event:
+                        activity_event_details.append(activity_event)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response is not None and exc.response.status_code == 404:
+                        logger.info(
+                            "managed activity event unavailable tenant=%s incident=%s event_id=%s status=404",
+                            tenant_uuid,
+                            incident_uuid,
+                            event_id,
+                        )
+                    else:
+                        logger.warning(
+                            "managed activity event enrichment failed incident=%s event_id=%s reason=%s",
+                            incident_uuid,
+                            event_id,
+                            exc,
+                        )
+                except Exception as exc:
                     logger.warning(
                         "managed activity event enrichment failed incident=%s event_id=%s reason=%s",
                         incident_uuid,
                         event_id,
                         exc,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "managed activity event enrichment failed incident=%s event_id=%s reason=%s",
-                    incident_uuid,
-                    event_id,
-                    exc,
-                )
-
-        articles = []
-        if articles_task:
-            await asyncio.sleep(0.5)
-            articles = await _safe_enrichment("external articles", incident_uuid, articles_task, [])
 
         return IncidentSourceBundle(
             incident_uuid=incident_uuid,
             tenant_uuid=tenant_uuid,
             defender_details=details if isinstance(details, dict) else {},
+            defender_context=defender_context if isinstance(defender_context, dict) else {},
             defender_contacts=contacts if isinstance(contacts, list) else [],
             secops_details=secops_details if isinstance(secops_details, dict) else {},
             activity_event_details=activity_event_details,
@@ -476,6 +597,8 @@ async def fetch_incident_bundle(
             stix=stix if isinstance(stix, dict) else {},
             summary=summary if isinstance(summary, dict) else {},
             articles=articles if isinstance(articles, list) else [],
+            contact_identity_digest=merged_digest,
+            observed_endpoint_count=observed_endpoint_count or detail_endpoint_count,
         )
     except Exception as exc:
         logger.debug("Intelligence enrichment failed for incident %s: %s", incident_uuid, exc)

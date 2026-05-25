@@ -52,6 +52,14 @@ class JournalSyncResult:
     skip_cooldown_seconds: float = 0.0
 
 
+@dataclasses.dataclass
+class OpenSnapshotResult:
+    processed_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    request_failed: bool = False
+
+
 def get_agent_id() -> str:
     data_dir = Path(__file__).resolve().parent.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -98,13 +106,23 @@ def shape_kafka_payload(
     )
 
 
-async def enrich_incident(client: LumuSession, tenant_uuid: str, company_key: str, inc_uuid: str, is_bootstrap_mode: bool = False):
+async def enrich_incident(
+    client: LumuSession,
+    tenant_uuid: str,
+    company_key: str,
+    inc_uuid: str,
+    is_bootstrap_mode: bool = False,
+    mode: str = "new",
+    stored_contact_digest: str = "",
+):
     return await fetch_incident_bundle(
         client=client,
         tenant_uuid=tenant_uuid,
         defender_key=company_key,
         incident_uuid=inc_uuid,
         is_bootstrap_mode=is_bootstrap_mode,
+        mode=mode,
+        stored_contact_digest=stored_contact_digest,
     )
 
 
@@ -215,7 +233,14 @@ async def run_journal_sync(
         if is_bootstrap_mode:
             logger.debug("High backlog detected (>= %s updates). Deep enrichments will be skipped.", current_items_per_page)
 
-        raw_incidents = analyzer.extract_incidents_from_updates(updates_list)
+        raw_incidents = [
+            incident
+            for incident in analyzer.extract_incidents_from_updates(updates_list)
+            if analyzer.has_seen_incident((incident.get("id") or incident.get("uuid") or ""))
+        ]
+        for incident in raw_incidents:
+            incident["_sync_mode"] = "update"
+            incident["_stored_contact_digest"] = analyzer.get_contact_digest(incident.get("id") or incident.get("uuid") or "")
         result.processed_count += len(raw_incidents)
 
         if raw_incidents:
@@ -275,6 +300,59 @@ async def run_journal_sync(
         )
 
     return result
+
+
+async def run_open_snapshot_sync(
+    client: LumuSession,
+    analyzer: Analyzer,
+    kafka: KafkaClient,
+    tenant_uuid: str,
+    tenant_name: str,
+    company_key: str,
+    kafka_topic: str,
+) -> OpenSnapshotResult:
+    result = OpenSnapshotResult()
+    try:
+        open_incidents = await client.get_open_incidents(company_key, from_date=None)
+        candidates = []
+        for incident in open_incidents:
+            incident_uuid = incident.get("id") or incident.get("uuid") or ""
+            if not incident_uuid:
+                continue
+            if not analyzer.should_process_incident(incident):
+                continue
+            incident = dict(incident)
+            incident["_sync_mode"] = "new" if not analyzer.has_seen_incident(incident_uuid) else "update"
+            incident["_stored_contact_digest"] = analyzer.get_contact_digest(incident_uuid)
+            candidates.append(incident)
+        result.processed_count = len(candidates)
+        if not candidates:
+            logger.info("Open snapshot found no new or changed incidents for tenant '%s'.", tenant_name)
+            return result
+        logger.info("Open snapshot detected %s new or changed incident(s) for tenant '%s'.", len(candidates), tenant_name)
+        success, failed = await process_and_send_batch(
+            client=client,
+            analyzer=analyzer,
+            kafka=kafka,
+            raw_incidents=candidates,
+            tenant_uuid=tenant_uuid,
+            tenant_name=tenant_name,
+            company_key=company_key,
+            kafka_topic=kafka_topic,
+            is_bootstrap_mode=False,
+        )
+        result.success_count = success
+        result.failure_count = failed
+        return result
+    except Exception as exc:
+        logger.warning(
+            "Open snapshot sync failed tenant=%s tenant_name=%s reason=%s",
+            tenant_uuid,
+            tenant_name,
+            exc,
+        )
+        result.request_failed = True
+        return result
 
 
 def should_run_open_state_reconciliation(analyzer: Analyzer, journal_result: JournalSyncResult, now_utc: datetime, settings) -> tuple[bool, str]:
@@ -381,16 +459,28 @@ async def monitor_tenant(
     kafka_topic: str,
 ):
     """
-    Monitors a single tenant using a journal-first strategy with scheduled open-state reconciliation.
+    Monitors a single tenant using an open-snapshot-first strategy with supplemental journal updates.
     """
     logger.info("Scanning security incidents for tenant '%s' (%s)...", tenant_name, tenant_uuid)
     publish_success_count = 0
     publish_failure_count = 0
-    reconciliation_reason = "not_due"
+    reconciliation_reason = "snapshot_primary"
     try:
         if not company_key:
             logger.warning("LUMU_DEFENDER_KEY is not set. Skipping incident scan.")
             return
+
+        snapshot_result = await run_open_snapshot_sync(
+            client=client,
+            analyzer=analyzer,
+            kafka=kafka,
+            tenant_uuid=tenant_uuid,
+            tenant_name=tenant_name,
+            company_key=company_key,
+            kafka_topic=kafka_topic,
+        )
+        publish_success_count += snapshot_result.success_count
+        publish_failure_count += snapshot_result.failure_count
 
         journal_result = await run_journal_sync(
             client=client,
@@ -403,57 +493,23 @@ async def monitor_tenant(
         )
         publish_success_count += journal_result.success_count
         publish_failure_count += journal_result.failure_count
-
-        now_utc = _utc_now()
-        should_reconcile, reconciliation_reason = should_run_open_state_reconciliation(
-            analyzer=analyzer,
-            journal_result=journal_result,
-            now_utc=now_utc,
-            settings=get_settings(),
-        )
-
-        if should_reconcile and reconciliation_reason in {"startup", "periodic_due"}:
-            if client.is_defender_near_daily_cap(company_key, threshold=0.85):
-                budget = client.get_defender_budget_snapshot(company_key)
-                should_reconcile = False
-                reconciliation_reason = "budget_degraded"
-                logger.warning(
-                    "Skipping non-critical reconciliation due to Defender daily budget pressure tenant=%s minute=%s/%s day=%s/%s",
-                    tenant_uuid,
-                    budget["minute_count"],
-                    budget["minute_limit"],
-                    budget["day_count"],
-                    budget["day_limit"],
-                )
-
-        if should_reconcile:
-            success, failed = await run_open_state_reconciliation(
-                client=client,
-                analyzer=analyzer,
-                kafka=kafka,
-                tenant_uuid=tenant_uuid,
-                tenant_name=tenant_name,
-                company_key=company_key,
-                kafka_topic=kafka_topic,
-                reason=reconciliation_reason,
-            )
-            publish_success_count += success
-            publish_failure_count += failed
-        else:
+        if journal_result.skipped_by_rate_guard:
+            reconciliation_reason = journal_result.skip_reason or "journal_rate_guard_skip"
             logger.info(
-                "Skipping open-state reconciliation tenant=%s next_due=%s",
+                "Skipping same-cycle open-state reconciliation tenant=%s reason=%s because open snapshot is primary",
                 tenant_uuid,
-                analyzer.open_state_sync_next_due_at or "unscheduled",
+                reconciliation_reason,
             )
 
     except Exception as e:
         logger.error(f"Error processing incidents for tenant {tenant_uuid}: {str(e)}")
     finally:
         logger.info(
-            "Cycle publish summary tenant=%s success=%s failed=%s journal_processed=%s reconciliation=%s next_due=%s",
+            "Cycle publish summary tenant=%s success=%s failed=%s snapshot_processed=%s journal_processed=%s reconciliation=%s next_due=%s",
             tenant_uuid,
             publish_success_count,
             publish_failure_count,
+            snapshot_result.processed_count if 'snapshot_result' in locals() else 0,
             journal_result.processed_count if 'journal_result' in locals() else 0,
             reconciliation_reason,
             analyzer.open_state_sync_next_due_at or "unscheduled",
@@ -492,12 +548,15 @@ async def process_and_send_batch(
 
     async def sem_enrich(inc_uuid):
         async with semaphore:
+            raw_inc = uuid_to_raw.get(inc_uuid) or {}
             result = await fetch_incident_bundle(
                 client=client,
                 tenant_uuid=tenant_uuid,
                 defender_key=company_key,
                 incident_uuid=inc_uuid,
                 is_bootstrap_mode=is_bootstrap_mode,
+                mode=str(raw_inc.get("_sync_mode") or "new"),
+                stored_contact_digest=str(raw_inc.get("_stored_contact_digest") or ""),
             )
             await asyncio.sleep(1.0)
             return result
@@ -564,7 +623,13 @@ async def process_and_send_batch(
                         kafka_topic,
                     )
 
-                    analyzer.update_incident_time(event.incident_uuid, event.last_contact)
+                    analyzer.update_incident_time(
+                        event.incident_uuid,
+                        event.last_contact,
+                        contact_digest=bundle.contact_identity_digest,
+                        observed_endpoint_count=bundle.observed_endpoint_count,
+                        status=event.status,
+                    )
                 except Exception as e:
                     failure_count += 1
                     logger.error(

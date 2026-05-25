@@ -795,6 +795,51 @@ class LumuSession:
             
         return all_open
 
+    async def get_open_incidents_lite(self, company_key: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all currently OPEN incidents using the dedicated open-incidents endpoint.
+        This is kept as an optional lighter snapshot path; the runtime still treats
+        /api/incidents/all with status=["open"] as the authoritative compatible source.
+        """
+        url = f"{self.settings.lumu_defender_url}/api/incidents/open"
+        params = self._maybe_attach_max_items({"key": company_key}, endpoint_name="open_incidents_lite")
+        all_open = []
+        seen_ids = set()
+        page = 1
+        page_size = 50
+
+        while True:
+            payload = {
+                "adversary-types": [],
+                "labels": [],
+            }
+            response = await self._request_with_retry(
+                "POST",
+                url,
+                params={**params, "page": page, "items": page_size},
+                json_data=payload,
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="open_incidents_lite",
+            )
+            if response.status_code != 200:
+                break
+            data = response.json()
+            items = data.get("items", []) if isinstance(data, dict) else []
+            if not items:
+                break
+            for item in items:
+                item_id = item.get("id") or item.get("uuid")
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    all_open.append(item)
+            if len(items) < page_size or page >= 200:
+                break
+            page += 1
+            await asyncio.sleep(0.5)
+
+        return all_open
+
     async def get_incident_details(self, company_key: str, incident_uuid: str) -> Dict[str, Any]:
         """
         Fetch incident details for a specific incident using its key.
@@ -868,6 +913,29 @@ class LumuSession:
         """
         endpoint = f"/intelligence/companies/{company_id}/secops-incidents/{incident_uuid}/context/summary"
         return await self.get_with_auth(endpoint)
+
+    async def get_incident_context(self, company_key: str, incident_uuid: str, hash_type: str = "sha256") -> Dict[str, Any]:
+        """
+        Fetch Defender context for an incident.
+        Endpoint: GET /api/incidents/{incident_uuid}/context?key={company-key}&hash={hash-type}
+        """
+        url = f"{self.settings.lumu_defender_url}/api/incidents/{incident_uuid}/context"
+        params = {"key": company_key, "hash": hash_type}
+        company = self._normalize_company_key(company_key)
+        semaphore = self._details_semaphores_by_company.setdefault(
+            company,
+            asyncio.Semaphore(max(1, int(self.rate_policy.details_per_tenant_concurrency))),
+        )
+        async with semaphore:
+            response = await self._request_with_retry(
+                "GET",
+                url,
+                params=params,
+                auth_required=False,
+                company_key=company_key,
+                endpoint_name="incident_context",
+            )
+            return response.json()
 
     async def get_incident_external_articles(self, company_id: str, incident_uuid: str) -> List[Dict[str, Any]]:
         """

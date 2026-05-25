@@ -42,6 +42,7 @@ class Analyzer:
             if not self.last_pulled_time:
                 self.last_pulled_time = get_settings().lumu_initial_time
             self._incident_times: Dict[str, str] = state_data.get("incidents", {})
+            self._incident_metadata: Dict[str, Dict[str, Any]] = state_data.get("incident_metadata", {})
             self.open_state_sync_last_success_at = str(state_data.get("open_state_sync_last_success_at", "") or "")
             self.open_state_sync_next_due_at = str(state_data.get("open_state_sync_next_due_at", "") or "")
             self.open_state_sync_failure_count = int(state_data.get("open_state_sync_failure_count", 0) or 0)
@@ -58,6 +59,7 @@ class Analyzer:
                 )
                 self.offset = env_offset
                 self._incident_times = {}
+                self._incident_metadata = {}
                 self.open_state_sync_last_success_at = ""
                 self.open_state_sync_next_due_at = ""
                 self.open_state_sync_failure_count = 0
@@ -65,6 +67,8 @@ class Analyzer:
                 self._save_state()
             else:
                 self.offset = persisted_offset
+        if not hasattr(self, "_incident_metadata"):
+            self._incident_metadata = {}
 
     @staticmethod
     def _format_utc(dt: datetime) -> str:
@@ -140,10 +144,45 @@ class Analyzer:
             return "NewIncidentCreated"
         return "IncidentUpdated"
 
-    def update_incident_time(self, uuid: str, timestamp: str):
+    def get_incident_metadata(self, uuid: str) -> Dict[str, Any]:
+        metadata = self._incident_metadata.get(uuid, {})
+        return metadata if isinstance(metadata, dict) else {}
+
+    def get_contact_digest(self, uuid: str) -> str:
+        return str(self.get_incident_metadata(uuid).get("contact_digest", "") or "")
+
+    def get_observed_endpoint_count(self, uuid: str) -> int:
+        value = self.get_incident_metadata(uuid).get("observed_endpoint_count", 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def has_seen_incident(self, uuid: str) -> bool:
+        return bool(uuid and uuid in self._incident_times)
+
+    def update_incident_time(
+        self,
+        uuid: str,
+        timestamp: str,
+        *,
+        contact_digest: str = "",
+        observed_endpoint_count: int = 0,
+        status: str = "",
+    ):
         if uuid and timestamp:
             normalized_ts = self._normalize_timestamp(timestamp)
             self._incident_times[uuid] = normalized_ts
+            metadata = self.get_incident_metadata(uuid)
+            metadata["last_contact"] = normalized_ts
+            metadata["contact_digest"] = str(contact_digest or metadata.get("contact_digest", "") or "")
+            metadata["observed_endpoint_count"] = max(
+                self.get_observed_endpoint_count(uuid),
+                int(observed_endpoint_count or 0),
+            )
+            if status:
+                metadata["status"] = status
+            self._incident_metadata[uuid] = metadata
             if not self.last_pulled_time:
                 self.last_pulled_time = normalized_ts
             else:
@@ -205,6 +244,7 @@ class Analyzer:
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(days=60)
             pruned_incidents: Dict[str, str] = {}
+            pruned_metadata: Dict[str, Dict[str, Any]] = {}
             for incident_uuid, raw_ts in self._incident_times.items():
                 try:
                     parsed = parse_utc_datetime(raw_ts)
@@ -212,9 +252,16 @@ class Analyzer:
                         raise ValueError("invalid timestamp")
                     if parsed >= cutoff:
                         pruned_incidents[incident_uuid] = self._format_utc(parsed)
+                        metadata = self.get_incident_metadata(incident_uuid)
+                        if metadata:
+                            pruned_metadata[incident_uuid] = metadata
                 except (ValueError, TypeError, OverflowError):
                     pruned_incidents[incident_uuid] = raw_ts
+                    metadata = self.get_incident_metadata(incident_uuid)
+                    if metadata:
+                        pruned_metadata[incident_uuid] = metadata
             self._incident_times = pruned_incidents
+            self._incident_metadata = pruned_metadata
 
             base_dir = Path(__file__).resolve().parent.parent / "data"
             abs_path = (base_dir / Path(self._state_file).name).resolve()
@@ -234,6 +281,7 @@ class Analyzer:
                         "last_pulled_time": self.last_pulled_time,
                         "offset": self.offset,
                         "incidents": self._incident_times,
+                        "incident_metadata": self._incident_metadata,
                         "open_state_sync_last_success_at": self.open_state_sync_last_success_at,
                         "open_state_sync_next_due_at": self.open_state_sync_next_due_at,
                         "open_state_sync_failure_count": self.open_state_sync_failure_count,
@@ -285,6 +333,11 @@ class Analyzer:
                 changed_events.append(event)
                 if normalized_last_contact:
                     self._incident_times[event.incident_uuid] = normalized_last_contact
+                    metadata = self.get_incident_metadata(event.incident_uuid)
+                    metadata["last_contact"] = normalized_last_contact
+                    if getattr(event, "status", ""):
+                        metadata["status"] = event.status
+                    self._incident_metadata[event.incident_uuid] = metadata
                     state_updated = True
             else:
                 logger.debug(

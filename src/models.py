@@ -105,6 +105,7 @@ class IncidentSourceBundle:
     incident_uuid: str
     tenant_uuid: str
     defender_details: Dict[str, Any] = field(default_factory=dict)
+    defender_context: Dict[str, Any] = field(default_factory=dict)
     defender_contacts: List[Dict[str, Any]] = field(default_factory=list)
     secops_details: Dict[str, Any] = field(default_factory=dict)
     activity_event_details: List[Dict[str, Any]] = field(default_factory=list)
@@ -112,3 +113,5 @@ class IncidentSourceBundle:
     stix: Dict[str, Any] = field(default_factory=dict)
     summary: Dict[str, Any] = field(default_factory=dict)
     articles: List[Dict[str, Any]] = field(default_factory=list)
+    contact_identity_digest: str = ""
+    observed_endpoint_count: int = 0
