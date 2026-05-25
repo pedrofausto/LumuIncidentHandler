@@ -33,6 +33,7 @@ MOVED_LUMU_FIELDS = {
     "stix_sighting",
     "activity_incident_details",
     "endpoint_context",
+    "last_contact_source",
 }
 
 
@@ -139,5 +140,5 @@ def serialize_incident_event(
     payload["decoder"] = {"name": "int-dec-lumu"}
     payload["manager"] = {"name": hostname}
     payload["product_name"] = "Lumu Defender"
-    payload["timezone"] = settings.payload_timezone
+    payload["timezone"] = "UTC"
     return payload

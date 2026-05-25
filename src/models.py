@@ -76,6 +76,7 @@ class IncidentEvent:
     first_contact: str
     last_contact: str
     endpoints_affected: int
+    last_contact_source: str = "top_level.lastContact"
     stix_indicators: List[StixIndicator] = field(default_factory=list)
     stix_malware: List[StixMalware] = field(default_factory=list)
     stix_sighting: Optional[StixSighting] = None

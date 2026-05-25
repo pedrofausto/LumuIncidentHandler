@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     kafka_client_id: str = Field("lumu-incident-handler", description="Kafka producer client id")
     kafka_delivery_timeout_seconds: float = Field(15.0, description="Timeout in seconds waiting for per-message Kafka delivery callback")
     kafka_flush_timeout_seconds: float = Field(10.0, description="Timeout in seconds for producer flush after publish")
-    payload_timezone: str = Field("UTC", description="Timezone label added to emitted Kafka payloads")
+    payload_timezone: str = Field("UTC", description="Timezone label of emitted Kafka payload timestamps; must match the serialized timestamp format")
     event_type_test_mode: bool = Field(False, description="If True, forces payload lumu.event_type to 'test'")
 
     model_config = SettingsConfigDict(
@@ -98,6 +98,14 @@ class Settings(BaseSettings):
         if not value.strip():
             raise ValueError("kafka_topic must be a non-empty string when provided")
         return value
+
+    @field_validator("payload_timezone")
+    @classmethod
+    def payload_timezone_must_be_utc(cls, value: str) -> str:
+        normalized = str(value or "").strip().upper()
+        if normalized != "UTC":
+            raise ValueError("payload_timezone must be UTC because emitted payload timestamps are serialized in UTC/Z format")
+        return "UTC"
 
     @field_validator(
         "polling_interval_minutes",

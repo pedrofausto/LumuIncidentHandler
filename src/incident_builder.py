@@ -2,7 +2,7 @@ import ipaddress
 import logging
 import re
 from datetime import timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil import parser
 
@@ -18,6 +18,7 @@ from .models import (
     StixSighting,
     ThreatIntelArticle,
 )
+from .time_utils import format_utc_z, parse_utc_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,22 @@ def _calculate_latency(start_iso: str, end_iso: str) -> Optional[str]:
         return f"{s}s"
     except Exception:
         return None
+
+
+def _choose_latest_timestamp(candidates: List[Tuple[str, Any]]) -> tuple[str, str]:
+    latest_dt = None
+    latest_raw = ""
+    latest_source = "top_level.lastContact"
+    for source, raw_value in candidates:
+        parsed = parse_utc_datetime(raw_value)
+        if parsed is None:
+            continue
+        normalized = format_utc_z(parsed)
+        if latest_dt is None or parsed > latest_dt:
+            latest_dt = parsed
+            latest_raw = normalized
+            latest_source = source
+    return latest_raw, latest_source
 
 
 def _looks_like_ip(value: str) -> bool:
@@ -433,7 +450,6 @@ def build_incident_event(
     status = raw_incident.get("status", "open")
     open_since = raw_incident.get("timestamp", "")
     first_contact = raw_incident.get("firstContact") or open_since
-    last_contact = raw_incident.get("lastContact") or raw_incident.get("statusTimestamp", "")
 
     raw_contacts_count = raw_incident.get("contacts", 0)
     endpoints_count = _coerce_count(raw_incident.get("totalEndpoints"))
@@ -558,6 +574,45 @@ def build_incident_event(
     det_contacts = det.get("contacts", []) if det else []
     first_contact_details = det.get("firstContactDetails", {}) if det else {}
     last_contact_details = det.get("lastContactDetails", {}) if det else {}
+    last_contact, last_contact_source = _choose_latest_timestamp(
+        [
+            ("top_level.lastContact", raw_incident.get("lastContact")),
+            ("top_level.statusTimestamp", raw_incident.get("statusTimestamp")),
+            (
+                "defender.lastContactDetails.datetime",
+                last_contact_details.get("datetime") if isinstance(last_contact_details, dict) else None,
+            ),
+            (
+                "defender.lastContactDetails.timestamp",
+                last_contact_details.get("timestamp") if isinstance(last_contact_details, dict) else None,
+            ),
+            (
+                "secops.lastEvent.datetime",
+                (secops_details.get("lastEvent") or {}).get("datetime") if isinstance(secops_details.get("lastEvent"), dict) else None,
+            ),
+            (
+                "secops.lastEvent.timestamp",
+                (secops_details.get("lastEvent") or {}).get("timestamp") if isinstance(secops_details.get("lastEvent"), dict) else None,
+            ),
+        ]
+    )
+    if not last_contact:
+        last_contact = raw_incident.get("lastContact") or raw_incident.get("statusTimestamp", "")
+        last_contact_source = "top_level.fallback"
+    normalized_top_level_last_contact, _ = _choose_latest_timestamp(
+        [
+            ("top_level.lastContact", raw_incident.get("lastContact")),
+            ("top_level.statusTimestamp", raw_incident.get("statusTimestamp")),
+        ]
+    )
+    if last_contact and normalized_top_level_last_contact and last_contact != normalized_top_level_last_contact:
+        logger.info(
+            "Promoting incident last_contact from enrichment incident_uuid=%s source=%s top_level=%s chosen=%s",
+            uuid,
+            last_contact_source,
+            normalized_top_level_last_contact,
+            last_contact,
+        )
     detail_contacts_list = det_contacts if isinstance(det_contacts, list) else []
     secops_targets: List[Dict[str, Any]] = []
     if isinstance(secops_details, dict):
@@ -663,6 +718,7 @@ def build_incident_event(
         first_contact=first_contact,
         last_contact=last_contact,
         endpoints_affected=endpoints_count,
+        last_contact_source=last_contact_source,
         stix_indicators=stix_indicators,
         stix_malware=stix_malware,
         stix_sighting=stix_sighting,

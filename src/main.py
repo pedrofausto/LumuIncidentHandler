@@ -544,6 +544,18 @@ async def process_and_send_batch(
 
                     await kafka.send_incident(event_dict, topic=kafka_topic)
                     success_count += 1
+                    incident_times = getattr(analyzer, "_incident_times", {}) or {}
+                    stored_ts = incident_times.get(event.incident_uuid, "")
+                    normalize_timestamp = getattr(analyzer, "_normalize_timestamp", lambda value: value)
+                    compare_timestamps = getattr(analyzer, "_compare_timestamps", lambda _candidate, _stored: None)
+                    logger.debug(
+                        "Incident decision incident_uuid=%s chosen_last_contact=%s stored_state_timestamp=%s source=%s comparison_result=%s decision=send",
+                        event.incident_uuid,
+                        event.last_contact,
+                        normalize_timestamp(stored_ts) if stored_ts else stored_ts,
+                        getattr(event, "last_contact_source", "unknown"),
+                        compare_timestamps(event.last_contact, stored_ts) if stored_ts else "missing_state",
+                    )
                     logger.info(
                         "Incident publish success tenant_uuid=%s tenant_name=%s incident_uuid=%s topic=%s",
                         tenant_uuid,
