@@ -115,3 +115,5 @@ class IncidentSourceBundle:
     articles: List[Dict[str, Any]] = field(default_factory=list)
     contact_identity_digest: str = ""
     observed_endpoint_count: int = 0
+    contacts_count: int = 0
+    endpoints_count: int = 0

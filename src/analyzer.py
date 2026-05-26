@@ -158,6 +158,20 @@ class Analyzer:
         except (TypeError, ValueError):
             return 0
 
+    def get_contacts_count(self, uuid: str) -> int:
+        value = self.get_incident_metadata(uuid).get("contacts_count", 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def get_endpoints_count(self, uuid: str) -> int:
+        value = self.get_incident_metadata(uuid).get("endpoints_count", 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def has_seen_incident(self, uuid: str) -> bool:
         return bool(uuid and uuid in self._incident_times)
 
@@ -168,7 +182,10 @@ class Analyzer:
         *,
         contact_digest: str = "",
         observed_endpoint_count: int = 0,
+        contacts_count: int = 0,
+        endpoints_count: int = 0,
         status: str = "",
+        save: bool = True,
     ):
         if uuid and timestamp:
             normalized_ts = self._normalize_timestamp(timestamp)
@@ -179,6 +196,14 @@ class Analyzer:
             metadata["observed_endpoint_count"] = max(
                 self.get_observed_endpoint_count(uuid),
                 int(observed_endpoint_count or 0),
+                )
+            metadata["contacts_count"] = max(
+                self.get_contacts_count(uuid),
+                int(contacts_count or 0),
+            )
+            metadata["endpoints_count"] = max(
+                self.get_endpoints_count(uuid),
+                int(endpoints_count or 0),
             )
             if status:
                 metadata["status"] = status
@@ -192,7 +217,8 @@ class Analyzer:
                         self.last_pulled_time = normalized_ts
                 elif comparison > 0:
                     self.last_pulled_time = normalized_ts
-            self._save_state()
+            if save:
+                self._save_state()
 
     def is_open_state_sync_due(self, now_utc: datetime) -> bool:
         next_due = self._parse_utc(self.open_state_sync_next_due_at)

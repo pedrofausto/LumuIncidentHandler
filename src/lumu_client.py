@@ -35,7 +35,7 @@ class LumuSession:
         self._rate_limit_lock = asyncio.Lock()
         self._defender_budget_lock = asyncio.Lock()
         self.rate_limit_hits = 0
-        self._min_request_interval = 2.0  # 2 seconds max globally
+        self._min_request_interval = float(self.rate_policy.defender_global_min_interval_seconds)
         self._defender_budget_by_key: Dict[str, Dict[str, Any]] = {}
         self._defender_max_items_unsupported_endpoints: set[str] = set()
         self._defender_admission_lock = asyncio.Lock()

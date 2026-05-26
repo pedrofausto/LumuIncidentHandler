@@ -379,6 +379,8 @@ async def fetch_incident_bundle(
     is_bootstrap_mode: bool = False,
     mode: str = "new",
     stored_contact_digest: str = "",
+    stored_endpoints_count: int = 0,
+    stored_contacts_count: int = 0,
 ) -> IncidentSourceBundle:
     try:
         details_task = client.get_incident_details(defender_key, incident_uuid)
@@ -413,13 +415,21 @@ async def fetch_incident_bundle(
             summary = _normalize_defender_context(defender_context)
 
         contacts: List[Dict[str, Any]] = []
-        detail_contacts = details.get("contacts") if isinstance(details, dict) else None
+        details_dict = details if isinstance(details, dict) else {}
+        detail_contacts = details_dict.get("contacts")
         detail_contacts_list = detail_contacts if isinstance(detail_contacts, list) else []
         detail_contact_digest, detail_endpoint_count = _build_contact_identity_digest(
             detail_contacts_list,
-            details.get("firstContactDetails") if isinstance(details, dict) else {},
-            details.get("lastContactDetails") if isinstance(details, dict) else {},
+            details_dict.get("firstContactDetails") if isinstance(details_dict, dict) else {},
+            details_dict.get("lastContactDetails") if isinstance(details_dict, dict) else {},
         )
+
+        current_endpoints = _coerce_count(details_dict.get("totalEndpoints") or details_dict.get("endpointsAffected"))
+        raw_contacts = details_dict.get("contacts")
+        if isinstance(raw_contacts, list):
+            current_contacts = len(raw_contacts)
+        else:
+            current_contacts = _coerce_count(raw_contacts)
 
         if mode == "new":
             expected_endpoints = _extract_expected_endpoint_count(details, secops_details)
@@ -434,9 +444,9 @@ async def fetch_incident_bundle(
             )
         else:
             should_fetch_contacts = (
-                stored_contact_digest
-                and detail_contact_digest
-                and detail_contact_digest != stored_contact_digest
+                (detail_contact_digest and detail_contact_digest != stored_contact_digest)
+                or (current_endpoints > stored_endpoints_count)
+                or (current_contacts > stored_contacts_count)
             )
 
         if should_fetch_contacts:
@@ -598,7 +608,9 @@ async def fetch_incident_bundle(
             summary=summary if isinstance(summary, dict) else {},
             articles=articles if isinstance(articles, list) else [],
             contact_identity_digest=detail_contact_digest,
-            observed_endpoint_count=observed_endpoint_count or detail_endpoint_count,
+            observed_endpoint_count=observed_endpoint_count or detail_endpoint_count or current_endpoints,
+            contacts_count=current_contacts,
+            endpoints_count=current_endpoints,
         )
     except Exception as exc:
         logger.debug("Intelligence enrichment failed for incident %s: %s", incident_uuid, exc)

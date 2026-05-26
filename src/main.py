@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import dataclasses
 import logging
 import random
@@ -114,6 +114,8 @@ async def enrich_incident(
     is_bootstrap_mode: bool = False,
     mode: str = "new",
     stored_contact_digest: str = "",
+    stored_endpoints_count: int = 0,
+    stored_contacts_count: int = 0,
 ):
     return await fetch_incident_bundle(
         client=client,
@@ -123,6 +125,8 @@ async def enrich_incident(
         is_bootstrap_mode=is_bootstrap_mode,
         mode=mode,
         stored_contact_digest=stored_contact_digest,
+        stored_endpoints_count=stored_endpoints_count,
+        stored_contacts_count=stored_contacts_count,
     )
 
 
@@ -455,6 +459,7 @@ async def process_and_send_batch(
     Enriches raw incidents and streams them to Kafka as they complete.
     """
     settings = get_settings()
+    policy = resolve_rate_policy_from_settings(settings)
     hostname = socket.gethostname()
     agent_id = get_agent_id()
     agent_ip = get_primary_host_ip()
@@ -468,11 +473,13 @@ async def process_and_send_batch(
     if not uuid_to_raw:
         return (0, 0)
 
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(policy.details_per_tenant_concurrency)
 
     async def sem_enrich(inc_uuid):
         async with semaphore:
             raw_inc = uuid_to_raw.get(inc_uuid) or {}
+            stored_endpoints_count = analyzer.get_endpoints_count(inc_uuid)
+            stored_contacts_count = analyzer.get_contacts_count(inc_uuid)
             result = await fetch_incident_bundle(
                 client=client,
                 tenant_uuid=tenant_uuid,
@@ -481,8 +488,9 @@ async def process_and_send_batch(
                 is_bootstrap_mode=is_bootstrap_mode,
                 mode=str(raw_inc.get("_sync_mode") or "new"),
                 stored_contact_digest=str(raw_inc.get("_stored_contact_digest") or ""),
+                stored_endpoints_count=stored_endpoints_count,
+                stored_contacts_count=stored_contacts_count,
             )
-            await asyncio.sleep(1.0)
             return result
 
     unique_uuids = list(uuid_to_raw.keys())
@@ -491,6 +499,7 @@ async def process_and_send_batch(
     logger.info(f"Enriching and streaming {len(unique_uuids)} incident(s) for '{tenant_name}'...")
     success_count = 0
     failure_count = 0
+    state_updated = False
 
     for finished_task in asyncio.as_completed(tasks):
         try:
@@ -552,8 +561,12 @@ async def process_and_send_batch(
                         event.last_contact,
                         contact_digest=bundle.contact_identity_digest,
                         observed_endpoint_count=bundle.observed_endpoint_count,
+                        contacts_count=bundle.contacts_count,
+                        endpoints_count=bundle.endpoints_count,
                         status=event.status,
+                        save=False,
                     )
+                    state_updated = True
                 except Exception as e:
                     failure_count += 1
                     logger.error(
@@ -567,6 +580,10 @@ async def process_and_send_batch(
         except Exception as e:
             logger.error(f"Streaming error for an incident task: {e}")
             failure_count += 1
+
+    if state_updated:
+        analyzer._save_state()
+
     return (success_count, failure_count)
 
 
@@ -666,25 +683,28 @@ async def run_loop():
                 tenants = await client.get_tenants(items=500, page=1)
                 logger.info("Discovered %s supervised tenant(s).", len(tenants))
                 discovered_uuids: set[str] = set()
-                key_fetch_success = 0
-                key_fetch_failed = 0
 
                 for tenant in tenants:
                     tenant_uuid = str(tenant.get("uuid") or "").strip()
+                    if tenant_uuid:
+                        discovered_uuids.add(tenant_uuid)
+
+                bootstrap_sem = asyncio.Semaphore(10)
+
+                async def fetch_tenant_key(tenant) -> str:
+                    tenant_uuid = str(tenant.get("uuid") or "").strip()
                     tenant_name = str(tenant.get("name") or "").strip() or "unknown"
                     if not tenant_uuid:
-                        continue
-                    discovered_uuids.add(tenant_uuid)
+                        return "skipped"
 
                     topic = normalize_customer_topic(tenant_name)
                     if not topic:
-                        key_fetch_failed += 1
                         logger.error(
                             "Skipping tenant due to invalid normalized topic tenant_uuid=%s tenant_name=%s",
                             tenant_uuid,
                             tenant_name,
                         )
-                        continue
+                        return "skipped"
 
                     if not force_full and tenant_uuid in tenant_registry:
                         existing = tenant_registry[tenant_uuid]
@@ -701,42 +721,54 @@ async def run_loop():
                                 tenant_name,
                                 topic,
                             )
-                        continue
+                        return "cached"
 
                     endpoint = (
                         f"/api/msp/companies/{settings.lumu_mssp_uuid}/"
                         f"supervised_companies/{tenant_uuid}/defender_api_key"
                     )
-                    try:
-                        key_response = await client.get_with_auth(endpoint)
-                        defender_api_key = ""
-                        if isinstance(key_response, dict):
-                            defender_api_key = str(key_response.get("defender_api_key") or "").strip()
-                        if not defender_api_key:
-                            raise RuntimeError("defender_api_key missing")
+                    async with bootstrap_sem:
+                        try:
+                            key_response = await client.get_with_auth(endpoint)
+                            defender_api_key = ""
+                            if isinstance(key_response, dict):
+                                defender_api_key = str(key_response.get("defender_api_key") or "").strip()
+                            if not defender_api_key:
+                                raise RuntimeError("defender_api_key missing")
 
-                        tenant_registry[tenant_uuid] = TenantRuntime(
-                            tenant_uuid=tenant_uuid,
-                            tenant_name=tenant_name,
-                            defender_api_key=defender_api_key,
-                            kafka_topic=topic,
-                        )
-                        analyzers_by_tenant.setdefault(tenant_uuid, Analyzer(state_file_key=tenant_uuid))
-                        key_fetch_success += 1
-                        logger.info(
-                            "Tenant key bootstrap success tenant_uuid=%s tenant_name=%s topic=%s",
-                            tenant_uuid,
-                            tenant_name,
-                            topic,
-                        )
-                    except Exception as exc:
-                        key_fetch_failed += 1
-                        logger.error(
-                            "Tenant key bootstrap failed tenant_uuid=%s tenant_name=%s reason=%s",
-                            tenant_uuid,
-                            tenant_name,
-                            exc,
-                        )
+                            tenant_registry[tenant_uuid] = TenantRuntime(
+                                tenant_uuid=tenant_uuid,
+                                tenant_name=tenant_name,
+                                defender_api_key=defender_api_key,
+                                kafka_topic=topic,
+                            )
+                            analyzers_by_tenant.setdefault(tenant_uuid, Analyzer(state_file_key=tenant_uuid))
+                            logger.info(
+                                "Tenant key bootstrap success tenant_uuid=%s tenant_name=%s topic=%s",
+                                tenant_uuid,
+                                tenant_name,
+                                topic,
+                            )
+                            return "success"
+                        except Exception as exc:
+                            logger.error(
+                                "Tenant key bootstrap failed tenant_uuid=%s tenant_name=%s reason=%s",
+                                tenant_uuid,
+                                tenant_name,
+                                exc,
+                            )
+                            return "failed"
+
+                tasks = []
+                for tenant in tenants:
+                    tenant_uuid = str(tenant.get("uuid") or "").strip()
+                    if not tenant_uuid:
+                        continue
+                    tasks.append(fetch_tenant_key(tenant))
+
+                results = await asyncio.gather(*tasks)
+                key_fetch_success = sum(1 for r in results if r == "success")
+                key_fetch_failed = sum(1 for r in results if r == "failed")
 
                 stale = set(tenant_registry.keys()) - discovered_uuids
                 for tenant_uuid in stale:
