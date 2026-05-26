@@ -597,7 +597,7 @@ async def fetch_incident_bundle(
             stix=stix if isinstance(stix, dict) else {},
             summary=summary if isinstance(summary, dict) else {},
             articles=articles if isinstance(articles, list) else [],
-            contact_identity_digest=merged_digest,
+            contact_identity_digest=detail_contact_digest,
             observed_endpoint_count=observed_endpoint_count or detail_endpoint_count,
         )
     except Exception as exc:

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import os
 import random
@@ -299,7 +299,11 @@ class Analyzer:
     def extract_incidents_from_updates(self, updates_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         incidents = []
         for update in updates_data:
-            event_type = next(iter(update.keys()))
+            if not update or not isinstance(update, dict):
+                continue
+            event_type = next(iter(update.keys()), None)
+            if not event_type:
+                continue
             event_data = update[event_type]
 
             if event_type in ["NewIncidentCreated", "IncidentUpdated", "IncidentClosed", "IncidentUnmuted", "IncidentMuted", "IncidentReopened"]:

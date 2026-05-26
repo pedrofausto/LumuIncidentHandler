@@ -329,7 +329,22 @@ async def run_open_snapshot_sync(
         if not candidates:
             logger.info("Open snapshot found no new or changed incidents for tenant '%s'.", tenant_name)
             return result
-        logger.info("Open snapshot detected %s new or changed incident(s) for tenant '%s'.", len(candidates), tenant_name)
+        near_cap = False
+        if getattr(client, "is_defender_near_daily_cap", None) and client.is_defender_near_daily_cap(company_key, threshold=0.85):
+            near_cap = True
+            if getattr(client, "get_defender_budget_snapshot", None):
+                budget = client.get_defender_budget_snapshot(company_key)
+                logger.warning(
+                    "Near Defender daily cap in snapshot mode tenant=%s minute=%s/%s day=%s/%s forcing bootstrap mode (skipping deep enrichments)",
+                    tenant_uuid,
+                    budget["minute_count"],
+                    budget["minute_limit"],
+                    budget["day_count"],
+                    budget["day_limit"],
+                )
+            else:
+                logger.warning("Near Defender daily cap in snapshot mode tenant=%s forcing bootstrap mode (skipping deep enrichments)", tenant_uuid)
+
         success, failed = await process_and_send_batch(
             client=client,
             analyzer=analyzer,
@@ -339,7 +354,7 @@ async def run_open_snapshot_sync(
             tenant_name=tenant_name,
             company_key=company_key,
             kafka_topic=kafka_topic,
-            is_bootstrap_mode=False,
+            is_bootstrap_mode=near_cap,
         )
         result.success_count = success
         result.failure_count = failed
@@ -355,98 +370,7 @@ async def run_open_snapshot_sync(
         return result
 
 
-def should_run_open_state_reconciliation(analyzer: Analyzer, journal_result: JournalSyncResult, now_utc: datetime, settings) -> tuple[bool, str]:
-    if journal_result.skipped_by_rate_guard:
-        return True, journal_result.skip_reason or "journal_rate_guard_skip"
-    if journal_result.request_failed:
-        return True, "journal_request_failed"
-    if journal_result.offset_missing:
-        return True, "journal_offset_missing"
-    if journal_result.updates_seen and not journal_result.offset_advanced:
-        return True, "journal_offset_stalled"
-    if settings.lumu_open_state_sync_on_startup and not analyzer.open_state_sync_last_success_at:
-        return True, "startup"
-    if analyzer.force_offset_reset_applied:
-        return True, "periodic_due"
-    if analyzer.is_open_state_sync_due(now_utc):
-        return True, "periodic_due"
-    return False, "not_due"
 
-
-async def run_open_state_reconciliation(
-    client: LumuSession,
-    analyzer: Analyzer,
-    kafka: KafkaClient,
-    tenant_uuid: str,
-    tenant_name: str,
-    company_key: str,
-    kafka_topic: str,
-    reason: str,
-) -> tuple[int, int]:
-    settings = get_settings()
-    now_utc = _utc_now()
-    logger.info(
-        "Starting open-state reconciliation tenant=%s tenant_name=%s reason=%s",
-        tenant_uuid,
-        tenant_name,
-        reason,
-    )
-    try:
-        open_incidents = await client.get_open_incidents(company_key, from_date=None)
-        to_enrich_state = [inc for inc in open_incidents if analyzer.should_process_incident(inc)]
-
-        if to_enrich_state:
-            logger.info("Detected %s new or updated open incident(s) during reconciliation.", len(to_enrich_state))
-            success, failed = await process_and_send_batch(
-                client,
-                analyzer,
-                kafka,
-                raw_incidents=to_enrich_state,
-                tenant_uuid=tenant_uuid,
-                tenant_name=tenant_name,
-                company_key=company_key,
-                kafka_topic=kafka_topic,
-                is_bootstrap_mode=False,
-            )
-        else:
-            logger.info("Open-state reconciliation found no changed incidents for tenant '%s'.", tenant_name)
-            success, failed = 0, 0
-
-        analyzer.mark_open_state_sync_success(
-            now_utc=now_utc,
-            interval_minutes=settings.lumu_open_state_reconciliation_minutes,
-            jitter_seconds=settings.lumu_open_state_jitter_seconds,
-        )
-        logger.info(
-            "Open-state reconciliation succeeded tenant=%s next_due=%s",
-            tenant_uuid,
-            analyzer.open_state_sync_next_due_at or "unscheduled",
-        )
-        return success, failed
-    except Exception as exc:
-        analyzer.mark_open_state_sync_failure(
-            now_utc=now_utc,
-            base_backoff_minutes=settings.lumu_open_state_failure_backoff_minutes,
-            max_backoff_minutes=settings.lumu_open_state_max_backoff_minutes,
-        )
-        if _is_429_http_error(exc):
-            logger.warning(
-                "Open-state reconciliation rate limited tenant=%s tenant_name=%s reason=%s next_due=%s",
-                tenant_uuid,
-                tenant_name,
-                reason,
-                analyzer.open_state_sync_next_due_at or "unscheduled",
-            )
-        else:
-            logger.warning(
-                "Open-state reconciliation failed tenant=%s tenant_name=%s reason=%s next_due=%s error=%s",
-                tenant_uuid,
-                tenant_name,
-                reason,
-                analyzer.open_state_sync_next_due_at or "unscheduled",
-                exc,
-            )
-        return 0, 0
 
 
 async def monitor_tenant(
@@ -829,11 +753,18 @@ async def run_loop():
                 )
 
             await refresh_tenant_registry(force_full=True)
+            last_full_refresh_time = time.monotonic()
 
             while True:
                 logger.info("--- Starting Incident Polling Cycle ---")
                 try:
-                    await refresh_tenant_registry(force_full=False)
+                    now = time.monotonic()
+                    force_full = False
+                    if now - last_full_refresh_time >= 86400:
+                        force_full = True
+                        last_full_refresh_time = now
+                        logger.info("Performing scheduled full tenant key refresh.")
+                    await refresh_tenant_registry(force_full=force_full)
                     await run_tenant_batch(
                         client=client,
                         kafka=kafka,
