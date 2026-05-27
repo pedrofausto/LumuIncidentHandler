@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import timedelta, timezone
 from urllib.parse import urlparse
 from typing import Any, Dict, List
@@ -11,6 +12,11 @@ from .lumu_client import LumuSession, LumuEndpointCooldownException
 from .models import IncidentSourceBundle
 
 logger = logging.getLogger("lumu_monitor")
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 async def _safe_enrichment(label: str, incident_uuid: str, operation, default):
@@ -237,9 +243,18 @@ def _collect_activity_event_ids(secops_details: Dict[str, Any]) -> List[str]:
         if not isinstance(value, str):
             return
         cleaned = value.strip()
-        if cleaned and cleaned not in seen_event_ids:
-            seen_event_ids.add(cleaned)
-            event_ids.append(cleaned)
+        if not cleaned or cleaned in seen_event_ids:
+            return
+        # Only accept UUIDv4-shaped identifiers to prevent 400 errors
+        # from the activity details endpoint which rejects short hex IDs.
+        if not _UUID_RE.match(cleaned):
+            logger.debug(
+                "Skipping non-UUID event id '%s' (does not match UUIDv4 pattern)",
+                cleaned,
+            )
+            return
+        seen_event_ids.add(cleaned)
+        event_ids.append(cleaned)
 
     def walk(value: Any, key_hint: str = "") -> None:
         normalized_hint = str(key_hint or "").strip().lower()
@@ -371,6 +386,63 @@ def _record_matches_incident(
     return True
 
 
+async def fetch_secops_endpoints_paginated(
+    client: LumuSession,
+    tenant_uuid: str,
+    incident_uuid: str
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all endpoints (targets) for a Console incident page by page.
+    """
+    endpoints: List[Dict[str, Any]] = []
+    page = 1
+    page_size = 50
+    max_pages = 50
+    seen_ids = set()
+    while page <= max_pages:
+        try:
+            data = await client.get_secops_incident_endpoints(tenant_uuid, incident_uuid, page=page, items=page_size)
+            if not data:
+                break
+            items = []
+            if isinstance(data, dict):
+                items = data.get("endpoints") or data.get("contacts") or data.get("items") or data.get("data") or []
+            elif isinstance(data, list):
+                items = data
+
+            if not items:
+                break
+
+            new_items_this_page = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("_id") or item.get("id") or item.get("endpointIp") or item.get("name")
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    endpoints.append(item)
+                    new_items_this_page += 1
+
+            if new_items_this_page == 0 or len(items) < page_size:
+                break
+            page += 1
+            await asyncio.sleep(0.1)
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                logger.info(
+                    "Endpoints enrichment unavailable (404) incident=%s page=%s — historical/closed incidents may lack target data",
+                    incident_uuid,
+                    page,
+                )
+            else:
+                logger.warning("Failed to fetch page %s of endpoints for incident %s: %s", page, incident_uuid, exc)
+            break
+        except Exception as exc:
+            logger.warning("Failed to fetch page %s of endpoints for incident %s: %s", page, incident_uuid, exc)
+            break
+    return endpoints
+
+
 async def fetch_incident_bundle(
     client: LumuSession,
     tenant_uuid: str,
@@ -381,10 +453,19 @@ async def fetch_incident_bundle(
     stored_contact_digest: str = "",
     stored_endpoints_count: int = 0,
     stored_contacts_count: int = 0,
+    minimal_mode: bool = False,
+    console_mode: bool = False,
 ) -> IncidentSourceBundle:
+    if minimal_mode:
+        return IncidentSourceBundle(incident_uuid=incident_uuid, tenant_uuid=tenant_uuid)
+
     try:
-        details_task = client.get_incident_details(defender_key, incident_uuid)
-        context_task = client.get_incident_context(defender_key, incident_uuid)
+        if console_mode:
+            details_task = client.get_secops_incident_details(tenant_uuid, incident_uuid)
+            context_task = None
+        else:
+            details_task = client.get_incident_details(defender_key, incident_uuid)
+            context_task = client.get_incident_context(defender_key, incident_uuid)
 
         stix_task = None
         summary_task = None
@@ -392,11 +473,15 @@ async def fetch_incident_bundle(
         if mode == "new":
             stix_task = client.get_incident_stix(tenant_uuid, incident_uuid)
             summary_task = client.get_incident_context_summary(tenant_uuid, incident_uuid)
-            secops_details_task = client.get_secops_incident_details(tenant_uuid, incident_uuid)
+            if not console_mode:
+                secops_details_task = client.get_secops_incident_details(tenant_uuid, incident_uuid)
 
         details = await _safe_enrichment("details", incident_uuid, details_task, {})
         await asyncio.sleep(0.5)
-        defender_context = await _safe_enrichment("defender context", incident_uuid, context_task, {})
+
+        defender_context = {}
+        if not console_mode and context_task:
+            defender_context = await _safe_enrichment("defender context", incident_uuid, context_task, {})
 
         stix: Dict[str, Any] = {}
         summary: Dict[str, Any] = {}
@@ -406,12 +491,15 @@ async def fetch_incident_bundle(
             stix = await _safe_enrichment("STIX", incident_uuid, stix_task, {})
             await asyncio.sleep(0.5)
             summary = await _safe_enrichment("summary", incident_uuid, summary_task, {})
-            await asyncio.sleep(0.5)
-            secops_details = await _safe_enrichment("secops details", incident_uuid, secops_details_task, {})
+            if not console_mode and secops_details_task:
+                await asyncio.sleep(0.5)
+                secops_details = await _safe_enrichment("secops details", incident_uuid, secops_details_task, {})
 
-            if not summary or not summary.get("additional"):
-                summary = _normalize_defender_context(defender_context)
-        else:
+        if console_mode:
+            # Under Console-first, details and secops details are the same Console Incident payload
+            secops_details = details
+
+        if not summary or not summary.get("additional"):
             summary = _normalize_defender_context(defender_context)
 
         contacts: List[Dict[str, Any]] = []
@@ -431,7 +519,9 @@ async def fetch_incident_bundle(
         else:
             current_contacts = _coerce_count(raw_contacts)
 
-        if mode == "new":
+        if console_mode:
+            should_fetch_contacts = True
+        elif mode == "new":
             expected_endpoints = _extract_expected_endpoint_count(details, secops_details)
             known_endpoint_ids = _collect_endpoint_ids_from_details(details, secops_details)
             contextual_endpoint_ids = _collect_contextual_endpoint_ids(details)
@@ -450,28 +540,31 @@ async def fetch_incident_bundle(
             )
 
         if should_fetch_contacts:
-            try:
-                contacts = await client.get_incident_contacts(defender_key, incident_uuid)
-            except httpx.HTTPStatusError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    logger.info(
-                        "contacts enrichment unavailable tenant=%s incident=%s source=defender_contacts status=404",
-                        tenant_uuid,
+            if console_mode:
+                contacts = await fetch_secops_endpoints_paginated(client, tenant_uuid, incident_uuid)
+            else:
+                try:
+                    contacts = await client.get_incident_contacts(defender_key, incident_uuid)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response is not None and exc.response.status_code == 404:
+                        logger.info(
+                            "contacts enrichment unavailable tenant=%s incident=%s source=defender_contacts status=404",
+                            tenant_uuid,
+                            incident_uuid,
+                        )
+                    else:
+                        logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
+                except LumuEndpointCooldownException as exc:
+                    logger.warning(
+                        "contacts enrichment deferred incident=%s tenant=%s endpoint=%s reason=%s cooldown=%.2fs",
                         incident_uuid,
+                        tenant_uuid,
+                        exc.endpoint_name,
+                        exc.reason_code,
+                        exc.cooldown_remaining_seconds,
                     )
-                else:
+                except Exception as exc:
                     logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
-            except LumuEndpointCooldownException as exc:
-                logger.warning(
-                    "contacts enrichment deferred incident=%s tenant=%s endpoint=%s reason=%s cooldown=%.2fs",
-                    incident_uuid,
-                    tenant_uuid,
-                    exc.endpoint_name,
-                    exc.reason_code,
-                    exc.cooldown_remaining_seconds,
-                )
-            except Exception as exc:
-                logger.warning("contacts enrichment failed for incident %s: %s", incident_uuid, exc)
 
         merged_digest, observed_endpoint_count = _build_contact_identity_digest(
             detail_contacts_list,
@@ -573,9 +666,17 @@ async def fetch_incident_bundle(
                     if isinstance(activity_event, dict) and activity_event:
                         activity_event_details.append(activity_event)
                 except httpx.HTTPStatusError as exc:
-                    if exc.response is not None and exc.response.status_code == 404:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status == 404:
                         logger.info(
                             "managed activity event unavailable tenant=%s incident=%s event_id=%s status=404",
+                            tenant_uuid,
+                            incident_uuid,
+                            event_id,
+                        )
+                    elif status == 400:
+                        logger.info(
+                            "managed activity event rejected (400) tenant=%s incident=%s event_id=%s — likely invalid identifier format",
                             tenant_uuid,
                             incident_uuid,
                             event_id,

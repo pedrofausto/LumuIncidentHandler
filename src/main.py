@@ -20,6 +20,7 @@ from .kafka_client import KafkaClient
 from .lumu_client import LumuSession
 from .payload_serializer import normalize_customer_topic, serialize_incident_event
 from .rate_policy import resolve_rate_policy_from_settings
+from .time_utils import parse_utc_datetime
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -152,6 +153,7 @@ async def run_journal_sync(
     tenant_name: str,
     company_key: str,
     kafka_topic: str,
+    minimal_mode: bool = False,
 ) -> JournalSyncResult:
     result = JournalSyncResult()
     settings = get_settings()
@@ -249,15 +251,17 @@ async def run_journal_sync(
 
         if raw_incidents:
             success, failed = await process_and_send_batch(
-                client,
-                analyzer,
-                kafka,
-                raw_incidents,
-                tenant_uuid,
-                tenant_name,
-                company_key,
-                kafka_topic,
+                client=client,
+                analyzer=analyzer,
+                kafka=kafka,
+                raw_incidents=raw_incidents,
+                tenant_uuid=tenant_uuid,
+                tenant_name=tenant_name,
+                company_key=company_key,
+                kafka_topic=kafka_topic,
                 is_bootstrap_mode=is_bootstrap_mode,
+                minimal_mode=minimal_mode,
+                console_mode=False,
             )
             result.success_count += success
             result.failure_count += failed
@@ -314,6 +318,7 @@ async def run_open_snapshot_sync(
     tenant_name: str,
     company_key: str,
     kafka_topic: str,
+    minimal_mode: bool = False,
 ) -> OpenSnapshotResult:
     result = OpenSnapshotResult()
     try:
@@ -359,6 +364,8 @@ async def run_open_snapshot_sync(
             company_key=company_key,
             kafka_topic=kafka_topic,
             is_bootstrap_mode=near_cap,
+            minimal_mode=minimal_mode,
+            console_mode=False,
         )
         result.success_count = success
         result.failure_count = failed
@@ -374,7 +381,69 @@ async def run_open_snapshot_sync(
         return result
 
 
+@dataclasses.dataclass
+class ConsoleSyncResult:
+    processed_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    request_failed: bool = False
 
+
+async def run_console_sync(
+    client: LumuSession,
+    analyzer: Analyzer,
+    kafka: KafkaClient,
+    tenant_uuid: str,
+    tenant_name: str,
+    company_key: str,
+    kafka_topic: str,
+) -> ConsoleSyncResult:
+    result = ConsoleSyncResult()
+    try:
+        open_incidents = await client.get_console_open_incidents(tenant_uuid)
+
+        candidates = []
+        for incident in open_incidents:
+            incident_uuid = incident.get("id") or incident.get("uuid") or ""
+            if not incident_uuid:
+                continue
+            if not analyzer.should_process_incident(incident):
+                continue
+            incident = dict(incident)
+            incident["_sync_mode"] = "new" if not analyzer.has_seen_incident(incident_uuid) else "update"
+            incident["_stored_contact_digest"] = analyzer.get_contact_digest(incident_uuid)
+            candidates.append(incident)
+
+        result.processed_count = len(candidates)
+        if not candidates:
+            logger.info("Console sync found no new or changed incidents for tenant '%s'.", tenant_name)
+            return result
+
+        success, failed = await process_and_send_batch(
+            client=client,
+            analyzer=analyzer,
+            kafka=kafka,
+            raw_incidents=candidates,
+            tenant_uuid=tenant_uuid,
+            tenant_name=tenant_name,
+            company_key=company_key,
+            kafka_topic=kafka_topic,
+            is_bootstrap_mode=False,
+            minimal_mode=False,
+            console_mode=True,
+        )
+        result.success_count = success
+        result.failure_count = failed
+        return result
+    except Exception as exc:
+        logger.warning(
+            "Console sync failed for tenant=%s tenant_name=%s: %s",
+            tenant_uuid,
+            tenant_name,
+            exc,
+        )
+        result.request_failed = True
+        return result
 
 
 async def monitor_tenant(
@@ -387,18 +456,21 @@ async def monitor_tenant(
     kafka_topic: str,
 ):
     """
-    Monitors a single tenant using an open-snapshot-first strategy with supplemental journal updates.
+    Monitors a single tenant using a Console-First strategy with Defender fallback.
     """
     logger.info("Scanning security incidents for tenant '%s' (%s)...", tenant_name, tenant_uuid)
     publish_success_count = 0
     publish_failure_count = 0
-    reconciliation_reason = "snapshot_primary"
+    reconciliation_reason = "console_primary"
+    snapshot_processed_count = 0
+    journal_processed_count = 0
+
     try:
         if not company_key:
             logger.warning("LUMU_DEFENDER_KEY is not set. Skipping incident scan.")
             return
 
-        snapshot_result = await run_open_snapshot_sync(
+        console_result = await run_console_sync(
             client=client,
             analyzer=analyzer,
             kafka=kafka,
@@ -407,27 +479,44 @@ async def monitor_tenant(
             company_key=company_key,
             kafka_topic=kafka_topic,
         )
-        publish_success_count += snapshot_result.success_count
-        publish_failure_count += snapshot_result.failure_count
 
-        journal_result = await run_journal_sync(
-            client=client,
-            analyzer=analyzer,
-            kafka=kafka,
-            tenant_uuid=tenant_uuid,
-            tenant_name=tenant_name,
-            company_key=company_key,
-            kafka_topic=kafka_topic,
-        )
-        publish_success_count += journal_result.success_count
-        publish_failure_count += journal_result.failure_count
-        if journal_result.skipped_by_rate_guard:
-            reconciliation_reason = journal_result.skip_reason or "journal_rate_guard_skip"
-            logger.info(
-                "Skipping same-cycle open-state reconciliation tenant=%s reason=%s because open snapshot is primary",
-                tenant_uuid,
-                reconciliation_reason,
+        if console_result.request_failed:
+            reconciliation_reason = "defender_fallback"
+            logger.warning(
+                "Console sync failed for tenant '%s'. Falling back to Defender API with minimal enrichment to ensure incident visibility.",
+                tenant_name,
             )
+            snapshot_result = await run_open_snapshot_sync(
+                client=client,
+                analyzer=analyzer,
+                kafka=kafka,
+                tenant_uuid=tenant_uuid,
+                tenant_name=tenant_name,
+                company_key=company_key,
+                kafka_topic=kafka_topic,
+                minimal_mode=True,
+            )
+            publish_success_count += snapshot_result.success_count
+            publish_failure_count += snapshot_result.failure_count
+            snapshot_processed_count = snapshot_result.processed_count
+
+            journal_result = await run_journal_sync(
+                client=client,
+                analyzer=analyzer,
+                kafka=kafka,
+                tenant_uuid=tenant_uuid,
+                tenant_name=tenant_name,
+                company_key=company_key,
+                kafka_topic=kafka_topic,
+                minimal_mode=True,
+            )
+            publish_success_count += journal_result.success_count
+            publish_failure_count += journal_result.failure_count
+            journal_processed_count = journal_result.processed_count
+        else:
+            publish_success_count += console_result.success_count
+            publish_failure_count += console_result.failure_count
+            snapshot_processed_count = console_result.processed_count
 
     except Exception as e:
         logger.error(f"Error processing incidents for tenant {tenant_uuid}: {str(e)}")
@@ -437,8 +526,8 @@ async def monitor_tenant(
             tenant_uuid,
             publish_success_count,
             publish_failure_count,
-            snapshot_result.processed_count if 'snapshot_result' in locals() else 0,
-            journal_result.processed_count if 'journal_result' in locals() else 0,
+            snapshot_processed_count,
+            journal_processed_count,
             reconciliation_reason,
             analyzer.open_state_sync_next_due_at or "unscheduled",
         )
@@ -453,8 +542,10 @@ async def process_and_send_batch(
     tenant_name: str,
     company_key: str,
     kafka_topic: str,
-    is_bootstrap_mode: bool = False
-)-> tuple[int, int]:
+    is_bootstrap_mode: bool = False,
+    minimal_mode: bool = False,
+    console_mode: bool = False,
+) -> tuple[int, int]:
     """
     Enriches raw incidents and streams them to Kafka as they complete.
     """
@@ -480,6 +571,31 @@ async def process_and_send_batch(
             raw_inc = uuid_to_raw.get(inc_uuid) or {}
             stored_endpoints_count = analyzer.get_endpoints_count(inc_uuid)
             stored_contacts_count = analyzer.get_contacts_count(inc_uuid)
+
+            status = str(raw_inc.get("status") or "open").strip().lower()
+            is_historical = False
+            last_contact_str = raw_inc.get("lastContact") or raw_inc.get("timestamp") or ""
+            age_days = None
+            if last_contact_str:
+                try:
+                    dt = parse_utc_datetime(last_contact_str)
+                    if dt:
+                        age_days = (datetime.now(timezone.utc) - dt).days
+                        if age_days >= settings.lumu_historical_cutoff_days:
+                            is_historical = True
+                except Exception as exc:
+                    logger.debug("Failed to parse incident timestamp %s: %s", last_contact_str, exc)
+
+            is_minimal = minimal_mode
+            if status in ("closed", "muted") or is_historical:
+                reason = f"status '{status}'" if status in ("closed", "muted") else f"historical (age {age_days} days)"
+                logger.info(
+                    "Incident %s is %s. Bypassing detailed enrichment (using minimal mode).",
+                    inc_uuid,
+                    reason,
+                )
+                is_minimal = True
+
             result = await fetch_incident_bundle(
                 client=client,
                 tenant_uuid=tenant_uuid,
@@ -490,6 +606,8 @@ async def process_and_send_batch(
                 stored_contact_digest=str(raw_inc.get("_stored_contact_digest") or ""),
                 stored_endpoints_count=stored_endpoints_count,
                 stored_contacts_count=stored_contacts_count,
+                minimal_mode=is_minimal,
+                console_mode=console_mode,
             )
             return result
 

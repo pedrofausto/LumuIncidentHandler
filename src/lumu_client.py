@@ -428,6 +428,20 @@ class LumuSession:
                             cooldown_seconds,
                             "journal_tenant_cooldown",
                         )
+                    else:
+                        max_blocking = float(self.rate_policy.non_journal_max_blocking_cooldown_seconds)
+                        if cooldown_seconds > max_blocking:
+                            logger.warning(
+                                "Non-journal endpoint rate-limited with cooldown exceeding max blocking threshold. Cooldown=%.2fs MaxBlocking=%.2fs",
+                                cooldown_seconds,
+                                max_blocking,
+                            )
+                            raise LumuEndpointCooldownException(
+                                endpoint_name or "unknown_defender_endpoint",
+                                resolved_company_key,
+                                cooldown_seconds,
+                                "endpoint_cooldown",
+                            )
                     if attempt == max_retries:
                         logger.error(f"Max retries reached for 429 error at {url}")
                         response.raise_for_status()
@@ -897,6 +911,143 @@ class LumuSession:
         """
         endpoint = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/details"
         return await self.get_with_auth(endpoint)
+
+    async def get_secops_incidents(self, company_uuid: str, page: int = 1, items: int = 50, status: str = "open") -> Dict[str, Any]:
+        """
+        Fetch incidents list from Console API.
+        Endpoint: POST /data-api/secops-incidents/companies/{company_uuid}/incidents/search
+        """
+        endpoint = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/search"
+        payload = {
+            "filters": [],
+            "sort-criteria": [],
+            "status": [status]
+        }
+        params = {"page": page, "items": items}
+        response = await self._request_with_retry(
+            "POST",
+            endpoint,
+            params=params,
+            json_data=payload,
+            auth_required=True
+        )
+        return response.json()
+
+    async def get_console_open_incidents(self, company_uuid: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all open incidents from the Console API, page by page.
+        """
+        all_open = []
+        seen_ids = set()
+        page = 1
+        page_size = 50
+        
+        while True:
+            logger.info(f"Fetching open incidents from Console API for tenant {company_uuid} (Page {page})...")
+            try:
+                data = await self.get_secops_incidents(company_uuid, page=page, items=page_size, status="open")
+            except Exception as exc:
+                logger.warning(f"Failed to fetch Console incidents page {page} for tenant {company_uuid}: {exc}")
+                raise
+                
+            if not data:
+                break
+                
+            items = data.get("items", []) if isinstance(data, dict) else []
+            if not items:
+                break
+                
+            new_items_this_page = 0
+            for item in items:
+                item_id = item.get("id") or item.get("uuid")
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    
+                    # Ensure compatibility with Defender API incident fields used by Builder/Analyzer
+                    grouping = item.get("incidentGroupingFields")
+                    if "adversaryId" not in item:
+                        if isinstance(grouping, dict):
+                            item["adversaryId"] = grouping.get("adversary", "")
+                    if "lastContact" not in item:
+                        last_ev = item.get("lastEvent")
+                        if isinstance(last_ev, dict) and last_ev.get("timestamp"):
+                            item["lastContact"] = last_ev.get("timestamp")
+                        else:
+                            item["lastContact"] = item.get("timestamp", "")
+                    if "firstContact" not in item:
+                        first_ev = item.get("firstEvent")
+                        if isinstance(first_ev, dict) and first_ev.get("timestamp"):
+                            item["firstContact"] = first_ev.get("timestamp")
+                        else:
+                            item["firstContact"] = item.get("timestamp", "")
+                    if "contacts" not in item:
+                        counts = item.get("counts")
+                        if isinstance(counts, dict):
+                            item["contacts"] = counts.get("endpointTargetsCount", 0)
+                    if "adversaries" not in item:
+                        offenders = item.get("offendersSamples")
+                        if isinstance(offenders, list):
+                            item["adversaries"] = [o.get("value") for o in offenders if isinstance(o, dict) and o.get("value")]
+                        if not item.get("adversaries") and isinstance(grouping, dict) and grouping.get("adversary"):
+                            item["adversaries"] = [grouping.get("adversary")]
+                            
+                    all_open.append(item)
+                    new_items_this_page += 1
+            
+            if items:
+                from .time_utils import parse_utc_datetime
+                last_item = items[-1]
+                last_contact_str = last_item.get("lastContact") or last_item.get("timestamp") or ""
+                if last_contact_str:
+                    try:
+                        dt = parse_utc_datetime(last_contact_str)
+                        if dt:
+                            age_days = (datetime.now(timezone.utc) - dt).days
+                            if age_days >= self.settings.lumu_historical_cutoff_days:
+                                logger.info(
+                                    "Last incident on page %s is historical (age %s days, cutoff %s days). Stopping pagination.",
+                                    page,
+                                    age_days,
+                                    self.settings.lumu_historical_cutoff_days,
+                                )
+                                break
+                    except Exception as exc:
+                        logger.debug("Failed to parse last item timestamp %s: %s", last_contact_str, exc)
+
+            if new_items_this_page == 0:
+                break
+                
+            if len(items) < page_size:
+                break
+                
+            page += 1
+            await asyncio.sleep(0.5)
+            
+        return all_open
+
+    async def get_secops_incident_endpoints(self, company_uuid: str, incident_uuid: str, page: int = 1, items: int = 50) -> Dict[str, Any]:
+        """
+        Fetch paginated endpoints/contacts for a Console incident, with fallback routes.
+        """
+        params = {"page": page, "items": items}
+        endpoint = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/endpoints"
+        try:
+            response = await self._request_with_retry("GET", endpoint, params=params, auth_required=True)
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # Fallback 1: /contacts
+                endpoint_contacts = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/contacts"
+                try:
+                    response = await self._request_with_retry("GET", endpoint_contacts, params=params, auth_required=True)
+                    return response.json()
+                except httpx.HTTPStatusError as exc2:
+                    if exc2.response is not None and exc2.response.status_code == 404:
+                        # Fallback 2: /targets
+                        endpoint_targets = f"/data-api/secops-incidents/companies/{company_uuid}/incidents/{incident_uuid}/targets"
+                        return await self.get_with_auth(endpoint_targets, params=params)
+                    raise
+            raise
 
     async def get_incident_stix(self, company_id: str, incident_uuid: str) -> Dict[str, Any]:
         """
