@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     lumu_defender_budget_minute_limit: int = Field(35, description="Per-tenant Defender request budget per minute")
     lumu_defender_budget_day_limit: int = Field(8000, description="Per-tenant Defender request budget per day (UTC)")
     lumu_defender_budget_enforce: bool = Field(True, description="If True, enforce Defender minute/day budgets before requests")
-    lumu_historical_cutoff_days: int = Field(7, description="Cutoff in days to consider an incident historical, skipping detailed enrichment")
+    lumu_historical_cutoff_days: int = Field(14, description="Cutoff in days to consider an incident historical, skipping detailed enrichment")
     lumu_journal_items_per_page: int = Field(100, description="Requested incident updates page size for Defender journal polling")
     lumu_journal_delay_time_seconds: int = Field(15, description="Long-poll delay parameter for Defender updates endpoint")
     lumu_journal_max_pages_per_cycle: int = Field(2, description="Maximum Defender update pages processed per tenant in one cycle")

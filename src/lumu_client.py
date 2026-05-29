@@ -997,22 +997,22 @@ class LumuSession:
             if items:
                 from .time_utils import parse_utc_datetime
                 last_item = items[-1]
-                last_contact_str = last_item.get("lastContact") or last_item.get("timestamp") or ""
-                if last_contact_str:
+                last_creation_str = last_item.get("timestamp") or ""
+                if last_creation_str:
                     try:
-                        dt = parse_utc_datetime(last_contact_str)
+                        dt = parse_utc_datetime(last_creation_str)
                         if dt:
                             age_days = (datetime.now(timezone.utc) - dt).days
                             if age_days >= self.settings.lumu_historical_cutoff_days:
                                 logger.info(
-                                    "Last incident on page %s is historical (age %s days, cutoff %s days). Stopping pagination.",
+                                    "Last incident on page %s is historical based on creation date (age %s days, cutoff %s days). Stopping pagination.",
                                     page,
                                     age_days,
                                     self.settings.lumu_historical_cutoff_days,
                                 )
                                 break
                     except Exception as exc:
-                        logger.debug("Failed to parse last item timestamp %s: %s", last_contact_str, exc)
+                        logger.debug("Failed to parse last item timestamp %s: %s", last_creation_str, exc)
 
             if new_items_this_page == 0:
                 break

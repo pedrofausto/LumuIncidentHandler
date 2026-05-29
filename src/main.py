@@ -572,29 +572,38 @@ async def process_and_send_batch(
             stored_endpoints_count = analyzer.get_endpoints_count(inc_uuid)
             stored_contacts_count = analyzer.get_contacts_count(inc_uuid)
 
-            status = str(raw_inc.get("status") or "open").strip().lower()
-            is_historical = False
-            last_contact_str = raw_inc.get("lastContact") or raw_inc.get("timestamp") or ""
-            age_days = None
-            if last_contact_str:
-                try:
-                    dt = parse_utc_datetime(last_contact_str)
-                    if dt:
-                        age_days = (datetime.now(timezone.utc) - dt).days
-                        if age_days >= settings.lumu_historical_cutoff_days:
-                            is_historical = True
-                except Exception as exc:
-                    logger.debug("Failed to parse incident timestamp %s: %s", last_contact_str, exc)
-
+            sync_mode = str(raw_inc.get("_sync_mode") or "new")
             is_minimal = minimal_mode
-            if status in ("closed", "muted") or is_historical:
-                reason = f"status '{status}'" if status in ("closed", "muted") else f"historical (age {age_days} days)"
+            
+            if sync_mode == "update":
                 logger.info(
-                    "Incident %s is %s. Bypassing detailed enrichment (using minimal mode).",
+                    "Incident %s is an update. Bypassing detailed enrichment (using minimal mode).",
                     inc_uuid,
-                    reason,
                 )
                 is_minimal = True
+            else:
+                status = str(raw_inc.get("status") or "open").strip().lower()
+                is_historical = False
+                creation_str = raw_inc.get("timestamp") or ""
+                age_days = None
+                if creation_str:
+                    try:
+                        dt = parse_utc_datetime(creation_str)
+                        if dt:
+                            age_days = (datetime.now(timezone.utc) - dt).days
+                            if age_days >= settings.lumu_historical_cutoff_days:
+                                is_historical = True
+                    except Exception as exc:
+                        logger.debug("Failed to parse incident timestamp %s: %s", creation_str, exc)
+
+                if status in ("closed", "muted") or is_historical:
+                    reason = f"status '{status}'" if status in ("closed", "muted") else f"historical (creation age {age_days} days)"
+                    logger.info(
+                        "New incident %s is %s. Bypassing detailed enrichment (using minimal mode).",
+                        inc_uuid,
+                        reason,
+                    )
+                    is_minimal = True
 
             result = await fetch_incident_bundle(
                 client=client,

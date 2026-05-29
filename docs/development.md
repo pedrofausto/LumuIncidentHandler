@@ -79,6 +79,7 @@ The Docker deployment includes several security-hardening measures:
 | `LUMU_JOURNAL_MAX_PAGES_PER_CYCLE` | `2` | Maximum journal pages processed for one tenant in a single cycle. |
 | `LUMU_DEFENDER_USE_MAX_ITEMS_PARAM` | `True` | Enables adding `max-items` on supported Defender list endpoints. |
 | `LUMU_DEFENDER_MAX_ITEMS_PARAM` | `500` | Value sent as `max-items` when enabled and endpoint supports it. |
+| `LUMU_HISTORICAL_CUTOFF_DAYS` | `14` | Cutoff in days to consider an incident historical (skipping detailed enrichment). Check uses Lumu console creation timestamp. |
 | `ALERT_STATE_FILE` | `data/sent_incidents.json` | Path to the high-water mark tracking file. |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka bootstrap servers. |
 | `KAFKA_TOPIC` | - | Legacy static topic (unused in multi-tenant runtime). |
@@ -97,7 +98,7 @@ View the real-time execution logs from the container:
 docker-compose logs -f
 ```
 
-### State Management
+### State Management & Selective Enrichment
 The system tracks incident activity in tenant-scoped files under `data/` using a **per-incident timestamp map**.
 
 The state file schema:
@@ -114,11 +115,17 @@ The state file schema:
 }
 ```
 
-An incident is re-enriched and re-published to Kafka if:
+An incident is eligible to be processed and published if:
 - Its UUID is **not in the `incidents` map** (new incident), or
-- Its `lastContact` is **newer than the stored timestamp** for that UUID (updated incident).
+- Its `lastContact` timestamp is **newer than the stored timestamp** for that UUID (updated incident).
 
-This ensures that incident updates - new endpoints, additional firewall responses, status changes - are always reflected in the Kafka topic payload stream.
+#### Selective Enrichment and Minimal Mode
+To protect Lumu's API rate limits and daily budgets, the system applies the following selective enrichment (`minimal_mode`) rules:
+1. **New Incidents**: Evaluated against the historical cutoff window configured by `LUMU_HISTORICAL_CUTOFF_DAYS` (default: `14` days), based on the grouping/creation `timestamp` in the Lumu console.
+   - If the incident creation timestamp is within the cutoff window (newer than 14 days), the system performs **full enrichment** (`minimal_mode=False`).
+   - If the incident creation timestamp is older than the cutoff window, the incident is flagged as historical and processed in **minimal mode** (`minimal_mode=True`), which skips deep/STIX API details.
+2. **Updated Incidents**: Since updated incidents are already captured in previous cycles, updates are always processed in **minimal mode** (`minimal_mode=True`) to prevent redundant detail requests.
+3. **Console API Pagination**: During open-incident reconciliation pagination, the system checks the `timestamp` of the last incident in each page. If it is older than the historical cutoff, pagination terminates early.
 
 The handler updates incident state only after a confirmed Kafka delivery callback. If delivery fails or times out, that incident remains eligible for retry in the next polling cycle.
 
